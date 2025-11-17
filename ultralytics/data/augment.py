@@ -191,9 +191,7 @@ class Compose:
             >>> compose = Compose(transforms)
             >>> transformed_data = compose(input_data)
         """
-        assert data["cls"].shape[0] == data["attributes"].shape[0], f'Class and attributes mismatch. {data["cls"].shape[0]} {data["attributes"].shape[0]}'
         for t in self.transforms:
-            print("Applying transform:", type(t))
             data = t(data)
         return data
 
@@ -821,7 +819,6 @@ class Mosaic(BaseMixTransform):
             cls.append(labels["cls"])
             instances.append(labels["instances"])
         # Final labels
-        # TODO: Include attributes?
         final_labels = {
             "im_file": mosaic_labels[0]["im_file"],
             "ori_shape": mosaic_labels[0]["ori_shape"],
@@ -833,7 +830,6 @@ class Mosaic(BaseMixTransform):
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
-        # TODO: Handle attributes
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -2142,7 +2138,6 @@ class Format:
         img = labels.pop("img")
         h, w = img.shape[:2]
         cls = labels.pop("cls")
-        attributes = labels.pop("attributes")
         instances = labels.pop("instances")
         instances.convert_bbox(format=self.bbox_format)
         instances.denormalize(w, h)
@@ -2158,9 +2153,8 @@ class Format:
                 )
             labels["masks"] = masks
         labels["img"] = self._format_img(img)
-        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
-        labels["attributes"] = torch.from_numpy(attributes) if nl else torch.zeros(nl, 0)
-        assert labels["cls"].shape[0] == labels["attributes"].shape[0], f'Class and attributes mismatch. {labels["cls"].shape[0]} {labels["attributes"].shape[0]}'
+        labels["cls"] = torch.from_numpy(cls[:, 0:1]) if nl else torch.zeros(nl, 1)
+        labels["attributes"] = torch.from_numpy(cls[:, 1:]) if nl else torch.zeros(nl, 0)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
         if self.return_keypoint:
             labels["keypoints"] = (

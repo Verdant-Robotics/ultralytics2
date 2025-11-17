@@ -404,8 +404,6 @@ class BaseTrainer:
             for i, batch in pbar:
                 assert "ignore_kpt" in batch
                 self.run_callbacks("on_train_batch_start")
-                print("for batch", batch['attributes'].shape)
-                print("for batch", batch['cls'].shape)
                 # Warmup
                 ni = i + nb * epoch
                 if ni <= nw:
@@ -427,8 +425,6 @@ class BaseTrainer:
                         preds = self.model(batch["img"])
                         loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
                     else:
-                        print(batch['attributes'].shape)
-                        print(batch['cls'].shape)
                         loss, self.loss_items = self.model(batch)
                     self.loss = loss.sum()
                     if RANK != -1:

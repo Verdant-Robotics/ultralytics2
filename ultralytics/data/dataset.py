@@ -134,10 +134,9 @@ class YOLODataset(BaseDataset):
                         {
                             "im_file": im_file,
                             "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
+                            "cls": lb[:, 0:1 + num_attributes],  # n, 1 + na
                             "bboxes": lb[:, 1 + num_attributes:1 + num_attributes + 4],  # n, 4
                             "segments": segments,
-                            "attributes": lb[:, 1:1 + num_attributes],
                             "keypoints": keypoints,
                             "ignore_kpt": ignore_kpt,
                             "normalized": True,
@@ -304,6 +303,8 @@ class YOLODataset(BaseDataset):
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
             if k in {"masks", "keypoints", "bboxes", "cls", "attributes", "segments", "obb"}:
+                # if k in {"cls", "attributes"}:
+                #     print("Collating", k, [v.shape for v in value])
                 value = torch.cat(value, 0)
             new_batch[k] = value
         assert new_batch["cls"].shape[0] == new_batch["attributes"].shape[0], "Class and attributes mismatch."

@@ -563,11 +563,45 @@ class v8PoseLoss(v8DetectionLoss):
                                                              stride_tensor, target_bboxes, pred_kpts, batch['ignore_kpt'])
 
             if 'attributes' in batch:
-                print("Attributes:")
-                print(batch['attributes'])
-                attributes = batch['attributes'].to(self.device).float()
-                attribute_losses = self.bce(pred_attributes, attributes.to(dtype))
-                loss[5] = attribute_losses[fg_mask].sum() / target_scores_sum
+                # print("Attributes:")
+                # print(batch['attributes'])
+                # TODO: convert attribute labels to 1-hot, and mask out -1 labels and unmatched anchors
+                # For each anchor, get the attribute for the corresponding gt object given by target_gt_idx
+                # target_gt_idx has size (bs, n_anchors)
+                flat_attributes = batch['attributes'].to(self.device).float()  # (n_targets_in_batch, n_attributes)
+                # print(f"flat_attributes type: {flat_attributes.dtype}, shape: {flat_attributes.shape}")
+                num_targets = targets.shape[1]  # Max number of targets per image
+                num_attributes = flat_attributes.shape[1]
+                attributes = torch.zeros(batch_size, num_targets, num_attributes, device=self.device)
+                for j in range(batch_size):
+                    matches = (batch_idx == j).view(-1)  # (n_targets_in_batch,)
+                    attributes[j, 0:matches.sum(), :] = flat_attributes[matches, :]
+                # print(f"attributes shape: {attributes.shape}, attributes type: {attributes.dtype}")
+
+                attribute_labels = torch.clamp(attributes, 0, 1).to(dtype=dtype)
+                attribute_mask = (attributes >= 0)  # -1 means ignore
+                # We want:
+                # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a], attr]
+                # We expand target_gt_idx to size (bs, n_anchors, n_attributes) and use scatter_() to set
+                # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a, attr], attr]
+                # print(f"pred_attributes type: {pred_attributes.dtype}, shape: {pred_attributes.shape}")
+                target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).expand(-1, -1, attribute_labels.shape[2])
+                anchor_attributes = torch.zeros_like(pred_attributes)  # (bs, n_anchors, n_attributes)
+                # print(f"anchor_attributes type: {anchor_attributes.dtype}, target_gt_idx_expanded type: {target_gt_idx_expanded.dtype}, attribute_labels type: {attribute_labels.dtype}")
+                anchor_attributes.scatter_(1, target_gt_idx_expanded, attribute_labels)
+                anchor_attribute_mask = torch.zeros_like(pred_attributes).to(dtype=bool)  # (bs, n_anchors, n_attributes)
+                anchor_attribute_mask.scatter_(1, target_gt_idx_expanded, attribute_mask)
+
+                attribute_losses = F.binary_cross_entropy_with_logits(
+                    pred_attributes,
+                    anchor_attributes,
+                    reduction="none",
+                )
+                attribute_losses *= anchor_attribute_mask
+                num_attribute_labels = max(anchor_attribute_mask.sum(), 1)
+
+                # fg_mask has shape (bs, n_anchors)
+                loss[5] = attribute_losses[anchor_attribute_mask].sum() / num_attribute_labels
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.pose  # pose gain
