@@ -58,7 +58,8 @@ if __name__ == "__main__":
         seed=1,
         batch=args.batch_size,
         name=experiment_name,
-        device=[0, 1, 2, 3, 4, 5, 6, 7],
+        device=[0],
+        #device=[0, 1, 2, 3, 4, 5, 6, 7],
         patience=args.patience,
     )
 

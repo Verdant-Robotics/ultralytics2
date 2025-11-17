@@ -220,8 +220,8 @@ def verify_image_label(args: tuple) -> list:
                 assert box_xywh.min() >= 0, f'Box coordinates should be in [0, 1]. Found {box_xywh[box_xywh < 0]}'
                 if keypoint:
                     # Check if we have keypoints in the label file
-                    keypoints = lb[:, num_classifications:].reshape(-1, ndim)[:, :2]
-                    if lb.shape[1] == num_expected_columns - nkpt * ndim:
+                    keypoints = lb[:, num_classifications + 4:].reshape(-1, ndim)[:, :2]
+                    if lb.shape[1] == num_classifications + 4:
                         ignore_kpt = True
                     else:
                         assert lb.shape[1] == num_expected_columns, f'Found {lb.shape[1]} columns. Expected {num_expected_columns}'
@@ -449,17 +449,17 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
         data["nc"] = len(data["names"])
 
     data["names"] = check_class_names(data["names"])
-    if "attributes" not in data and "na" not in data:
+    if "attribute_names" not in data and "na" not in data:
         data["na"] = 0
-        data["attributes"] = []
-    elif "attributes" in data and "na" in data and len(data["attributes"]) != data["na"]:
+        data["attribute_names"] = []
+    elif "attribute_names" in data and "na" in data and len(data["attribute_names"]) != data["na"]:
         raise SyntaxError(
-            emojis(f"{dataset} declares {len(data['attributes'])} attributes but na={data['na']}")
+            emojis(f"{dataset} declares {len(data['attribute_names'])} attributes but na={data['na']}")
         )
-    elif "attributes" not in data:
-        data["attributes"] = {i: f"class_{i}" for i in range(data["na"])}
+    elif "attribute_names" not in data:
+        data["attribute_names"] = {i: f"class_{i}" for i in range(data["na"])}
     else:
-        data["na"] = len(data["attributes"])
+        data["na"] = len(data["attribute_names"])
     data["channels"] = data.get("channels", 3)  # get image channels, default to 3
 
     # Resolve paths

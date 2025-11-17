@@ -102,7 +102,7 @@ class YOLODataset(BaseDataset):
         total = len(self.im_files)
         nkpt, ndim = self.data.get("kpt_shape", (0, 0))
         num_classes = len(self.data['names'])
-        num_attributes = len(self.data['attributes']) if 'attributes' in self.data else 0
+        num_attributes = len(self.data['attribute_names']) if 'attribute_names' in self.data else 0
         if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):
             raise ValueError(
                 "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
@@ -303,9 +303,10 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "attributes", "segments", "obb"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
+        assert new_batch["cls"].shape[0] == new_batch["attributes"].shape[0], "Class and attributes mismatch."
         new_batch["batch_idx"] = list(new_batch["batch_idx"])
         for i in range(len(new_batch["batch_idx"])):
             new_batch["batch_idx"][i] += i  # add target image index for build_targets()

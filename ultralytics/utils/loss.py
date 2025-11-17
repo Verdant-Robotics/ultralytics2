@@ -298,6 +298,8 @@ class v8DetectionLoss:
             )
 
         if 'attributes' in batch:
+            print("Attributes:")
+            print(batch['attributes'])
             attributes = batch['attributes'].to(self.device).float()
             attribute_losses = self.bce(pred_attributes, attributes.to(dtype))
             loss[3] = attribute_losses[fg_mask].sum() / target_scores_sum
@@ -561,6 +563,8 @@ class v8PoseLoss(v8DetectionLoss):
                                                              stride_tensor, target_bboxes, pred_kpts, batch['ignore_kpt'])
 
             if 'attributes' in batch:
+                print("Attributes:")
+                print(batch['attributes'])
                 attributes = batch['attributes'].to(self.device).float()
                 attribute_losses = self.bce(pred_attributes, attributes.to(dtype))
                 loss[5] = attribute_losses[fg_mask].sum() / target_scores_sum
