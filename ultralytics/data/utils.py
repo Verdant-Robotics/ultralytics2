@@ -451,7 +451,7 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
     data["names"] = check_class_names(data["names"])
     if "attribute_names" not in data and "na" not in data:
         data["na"] = 0
-        data["attribute_names"] = []
+        data["attribute_names"] = {}
     elif "attribute_names" in data and "na" in data and len(data["attribute_names"]) != data["na"]:
         raise SyntaxError(
             emojis(f"{dataset} declares {len(data['attribute_names'])} attributes but na={data['na']}")

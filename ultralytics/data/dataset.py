@@ -303,11 +303,8 @@ class YOLODataset(BaseDataset):
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
             if k in {"masks", "keypoints", "bboxes", "cls", "attributes", "segments", "obb"}:
-                # if k in {"cls", "attributes"}:
-                #     print("Collating", k, [v.shape for v in value])
                 value = torch.cat(value, 0)
             new_batch[k] = value
-        assert new_batch["cls"].shape[0] == new_batch["attributes"].shape[0], "Class and attributes mismatch."
         new_batch["batch_idx"] = list(new_batch["batch_idx"])
         for i in range(len(new_batch["batch_idx"])):
             new_batch["batch_idx"][i] += i  # add target image index for build_targets()
