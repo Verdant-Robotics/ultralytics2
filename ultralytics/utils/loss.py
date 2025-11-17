@@ -215,21 +215,29 @@ class v8DetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
+    def unflatten_batch(self, objects: torch.Tensor, batch_idx: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Converts a single list containing all objects for a batch to a tensor whose first dimension
+        is the batch index.
+        """
+        if objects.shape[0] == 0:
+            max_objects_per_image = torch.tensor(0, device=self.device)
+        else:
+            _, counts = batch_idx.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            max_objects_per_image = counts.max()
+        out = torch.zeros(batch_size, max_objects_per_image, *objects.shape[1:], device=self.device)
+        for i in range(batch_size):
+            matches = (batch_idx == i).view(-1)
+            out[i, 0:matches.sum()] = objects[matches, :]
+        return out
+
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
-        nl, ne = targets.shape
-        if nl == 0:
-            out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
-        else:
-            i = targets[:, 0]  # image index
-            _, counts = i.unique(return_counts=True)
-            counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, counts.max(), ne - 1, device=self.device)
-            for j in range(batch_size):
-                matches = i == j
-                if n := matches.sum():
-                    out[j, :n] = targets[matches, 1:]
-            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+        batch_idx = targets[:, 0]
+        objects = targets[:, 1:]
+        out = self.unflatten_batch(objects, batch_idx, batch_size)
+        out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
 
     def bbox_decode(self, anchor_points: torch.Tensor, pred_dist: torch.Tensor) -> torch.Tensor:
@@ -240,6 +248,40 @@ class v8DetectionLoss:
             # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
+
+    def calculate_attribute_loss(self, batch, pred_attributes, target_gt_idx):
+        flat_attributes = batch['attributes'].to(self.device).float()  # (n_targets_in_batch, n_attributes)
+        batch_idx = batch['batch_idx'].view(-1, 1)
+        batch_size = pred_attributes.shape[0]
+        dtype = pred_attributes.dtype
+        attributes = self.unflatten_batch(flat_attributes, batch_idx, batch_size)
+        # print(f"attributes shape: {attributes.shape}, attributes type: {attributes.dtype}")
+
+        attribute_labels = torch.clamp(attributes, 0, 1).to(dtype=dtype)
+        attribute_mask = (attributes >= 0)  # -1 means ignore
+        # We want:
+        # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a], attr]
+        # We expand target_gt_idx to size (bs, n_anchors, n_attributes) and use scatter_() to set
+        # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a, attr], attr]
+        # print(f"pred_attributes type: {pred_attributes.dtype}, shape: {pred_attributes.shape}")
+        num_attributes = attribute_labels.shape[2]  # Number of attributes per object
+        target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).expand(-1, -1, num_attributes)
+        anchor_attributes = torch.zeros_like(pred_attributes)  # (bs, n_anchors, n_attributes)
+        # print(f"anchor_attributes type: {anchor_attributes.dtype}, target_gt_idx_expanded type: {target_gt_idx_expanded.dtype}, attribute_labels type: {attribute_labels.dtype}")
+        anchor_attributes.scatter_(1, target_gt_idx_expanded, attribute_labels)
+        anchor_attribute_mask = torch.zeros_like(pred_attributes).to(dtype=bool)  # (bs, n_anchors, n_attributes)
+        anchor_attribute_mask.scatter_(1, target_gt_idx_expanded, attribute_mask)
+
+        attribute_losses = F.binary_cross_entropy_with_logits(
+            pred_attributes,
+            anchor_attributes,
+            reduction="none",
+        )
+        attribute_losses *= anchor_attribute_mask
+        num_attribute_labels = max(anchor_attribute_mask.sum(), 1)
+
+        # fg_mask has shape (bs, n_anchors)
+        return attribute_losses[anchor_attribute_mask].sum() / num_attribute_labels
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
@@ -269,7 +311,7 @@ class v8DetectionLoss:
         # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
         # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -298,11 +340,7 @@ class v8DetectionLoss:
             )
 
         if 'attributes' in batch:
-            print("Attributes:")
-            print(batch['attributes'])
-            attributes = batch['attributes'].to(self.device).float()
-            attribute_losses = self.bce(pred_attributes, attributes.to(dtype))
-            loss[3] = attribute_losses[fg_mask].sum() / target_scores_sum
+            loss[3] = self.calculate_attribute_loss(batch, pred_attributes, target_gt_idx)
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
@@ -563,45 +601,7 @@ class v8PoseLoss(v8DetectionLoss):
                                                              stride_tensor, target_bboxes, pred_kpts, batch['ignore_kpt'])
 
             if 'attributes' in batch:
-                # print("Attributes:")
-                # print(batch['attributes'])
-                # TODO: convert attribute labels to 1-hot, and mask out -1 labels and unmatched anchors
-                # For each anchor, get the attribute for the corresponding gt object given by target_gt_idx
-                # target_gt_idx has size (bs, n_anchors)
-                flat_attributes = batch['attributes'].to(self.device).float()  # (n_targets_in_batch, n_attributes)
-                # print(f"flat_attributes type: {flat_attributes.dtype}, shape: {flat_attributes.shape}")
-                num_targets = targets.shape[1]  # Max number of targets per image
-                num_attributes = flat_attributes.shape[1]
-                attributes = torch.zeros(batch_size, num_targets, num_attributes, device=self.device)
-                for j in range(batch_size):
-                    matches = (batch_idx == j).view(-1)  # (n_targets_in_batch,)
-                    attributes[j, 0:matches.sum(), :] = flat_attributes[matches, :]
-                # print(f"attributes shape: {attributes.shape}, attributes type: {attributes.dtype}")
-
-                attribute_labels = torch.clamp(attributes, 0, 1).to(dtype=dtype)
-                attribute_mask = (attributes >= 0)  # -1 means ignore
-                # We want:
-                # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a], attr]
-                # We expand target_gt_idx to size (bs, n_anchors, n_attributes) and use scatter_() to set
-                # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a, attr], attr]
-                # print(f"pred_attributes type: {pred_attributes.dtype}, shape: {pred_attributes.shape}")
-                target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).expand(-1, -1, attribute_labels.shape[2])
-                anchor_attributes = torch.zeros_like(pred_attributes)  # (bs, n_anchors, n_attributes)
-                # print(f"anchor_attributes type: {anchor_attributes.dtype}, target_gt_idx_expanded type: {target_gt_idx_expanded.dtype}, attribute_labels type: {attribute_labels.dtype}")
-                anchor_attributes.scatter_(1, target_gt_idx_expanded, attribute_labels)
-                anchor_attribute_mask = torch.zeros_like(pred_attributes).to(dtype=bool)  # (bs, n_anchors, n_attributes)
-                anchor_attribute_mask.scatter_(1, target_gt_idx_expanded, attribute_mask)
-
-                attribute_losses = F.binary_cross_entropy_with_logits(
-                    pred_attributes,
-                    anchor_attributes,
-                    reduction="none",
-                )
-                attribute_losses *= anchor_attribute_mask
-                num_attribute_labels = max(anchor_attribute_mask.sum(), 1)
-
-                # fg_mask has shape (bs, n_anchors)
-                loss[5] = attribute_losses[anchor_attribute_mask].sum() / num_attribute_labels
+                loss[5] = self.calculate_attribute_loss(batch, pred_attributes, target_gt_idx)
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.pose  # pose gain
