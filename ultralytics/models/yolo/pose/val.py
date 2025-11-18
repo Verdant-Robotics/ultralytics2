@@ -115,7 +115,7 @@ class PoseValidator(DetectionValidator):
         nkpt = self.kpt_shape[0]
         self.sigma = OKS_SIGMA if is_pose else np.ones(nkpt) / nkpt
 
-    def postprocess(self, preds: torch.Tensor) -> dict[str, torch.Tensor]:
+    def postprocess(self, preds: torch.Tensor) -> list[dict[str, torch.Tensor]]:
         """Postprocess YOLO predictions to extract and reshape keypoints for pose estimation.
 
         This method extends the parent class postprocessing by extracting keypoints from the 'extra' field of
@@ -127,7 +127,7 @@ class PoseValidator(DetectionValidator):
                 scores, class predictions, and keypoint data.
 
         Returns:
-            (dict[torch.Tensor]): Dict of processed prediction dictionaries, each containing:
+            List of processed prediction dictionaries, each containing:
                 - 'bboxes': Bounding box coordinates
                 - 'conf': Confidence scores
                 - 'cls': Class predictions
@@ -138,10 +138,14 @@ class PoseValidator(DetectionValidator):
             to the next one. The keypoints are extracted from the 'extra' field which contains additional
             task-specific data beyond basic detection.
         """
-        preds = super().postprocess(preds)
-        for pred in preds:
-            pred["keypoints"] = pred.pop("extra").view(-1, *self.kpt_shape)  # remove extra if exists
-        return preds
+        results = super().postprocess(preds)
+        assert self.kpt_shape is not None, "PoseValidator requires a Pose model with a kpt_shape"
+        num_keypoint_dims = np.prod(self.kpt_shape)
+        for result in results:
+            # Extras contain, first, binary attributes (if any), then keypoints (if any).
+            extra = result.pop("extra")
+            result["keypoints"] = extra[:, -num_keypoint_dims:].view(-1, *self.kpt_shape)
+        return results
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
         """Prepare a batch for processing by converting keypoints to float and scaling to original dimensions.

@@ -32,7 +32,7 @@ def PrepareDataset(coco_classes_file, dataset_yaml, training_task):
         for i in range(len(classes)):
             f.write(f"  {i}: {classes[i]}\n")
         if len(attributes) > 0:
-            f.write("\nattributes:\n")
+            f.write("\nattribute_names:\n")
             for i in range(len(attributes)):
                 f.write(f"  {i}: {attributes[i]}\n")
         if training_task == "pose":

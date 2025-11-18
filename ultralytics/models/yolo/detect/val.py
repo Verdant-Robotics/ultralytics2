@@ -59,6 +59,7 @@ class DetectionValidator(BaseValidator):
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
+        self.na: int = 0  # number of attributes
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch of images for YOLO validation.
@@ -92,6 +93,7 @@ class DetectionValidator(BaseValidator):
         self.args.save_json |= self.args.val and (self.is_coco or self.is_lvis) and not self.training  # run final val
         self.names = model.names
         self.nc = len(model.names)
+        self.kpt_shape = getattr(model, "kpt_shape", None)
         self.end2end = getattr(model, "end2end", False)
         self.seen = 0
         self.jdict = []
