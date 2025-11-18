@@ -76,7 +76,6 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         Returns:
             (PoseModel): Initialized pose estimation model.
         """
-        print(f"Creating model with {self.data['attribute_names']=} {self.data['na']=}")
         model = PoseModel(
             cfg, nc=self.data["nc"], na=self.data["na"], ch=self.data["channels"], data_kpt_shape=self.data["kpt_shape"], verbose=verbose
         )

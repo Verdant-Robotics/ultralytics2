@@ -303,8 +303,6 @@ class YOLODataset(BaseDataset):
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
             if k in {"masks", "keypoints", "bboxes", "cls", "attributes", "segments", "obb"}:
-                # if k in {"cls", "attributes"}:
-                #     print(f"Collating {k} with shapes {[v.shape for v in value]}")
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])

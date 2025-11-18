@@ -384,7 +384,6 @@ class DetectionModel(BaseModel):
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value
-        print(f"Initializing DetectionModel with {na=}")
         if na and na != self.yaml.get("na", None):
             LOGGER.info(f"Overriding model.yaml na={self.yaml.get('na', None)} with na={na}")
             self.yaml["na"] = na  # override YAML value

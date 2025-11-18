@@ -263,15 +263,9 @@ class v8DetectionLoss:
         # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a], attr]
         # We expand target_gt_idx to size (bs, n_anchors, n_attributes) and use scatter_() to set
         # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a, attr], attr]
-        # print(f"pred_attributes type: {pred_attributes.dtype}, shape: {pred_attributes.shape}")
         num_attributes = attribute_labels.shape[2]  # Number of attributes per object
         target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).expand(-1, -1, num_attributes)
-        # print(f"anchor_attributes type: {anchor_attributes.dtype}, target_gt_idx_expanded type: {target_gt_idx_expanded.dtype}, attribute_labels type: {attribute_labels.dtype}")
-        # anchor_attributes = torch.zeros_like(pred_attributes)  # (bs, n_anchors, n_attributes)
-        # anchor_attributes.scatter_(1, target_gt_idx_expanded, attribute_labels)
         anchor_attributes = torch.gather(attribute_labels, 1, target_gt_idx_expanded)
-        # anchor_attribute_mask = torch.zeros_like(pred_attributes).to(dtype=bool)  # (bs, n_anchors, n_attributes)
-        # anchor_attribute_mask.scatter_(1, target_gt_idx_expanded, attribute_mask)
         anchor_attribute_mask = torch.gather(attribute_mask, 1, target_gt_idx_expanded)
 
         attribute_losses = F.binary_cross_entropy_with_logits(

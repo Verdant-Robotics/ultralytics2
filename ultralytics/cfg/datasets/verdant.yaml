@@ -4,10 +4,8 @@ val: images/val
 test: images/test
 
 names:
-  0: weed
-
-attribute_names:
-  0: large
+  0: crop
+  1: weed
 
 kpt_shape: [1, 3]
 flip_idx: [0]
