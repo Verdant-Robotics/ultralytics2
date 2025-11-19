@@ -360,13 +360,14 @@ class DetectionModel(BaseModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, na=None, verbose=True):
         """Initialize the YOLO detection model with the given config and parameters.
 
         Args:
             cfg (str | dict): Model configuration file path or dictionary.
             ch (int): Number of input channels.
             nc (int, optional): Number of classes.
+            na (int, optional): Number of binary attributes.
             verbose (bool): Whether to display model information.
         """
         super().__init__()
@@ -383,6 +384,9 @@ class DetectionModel(BaseModel):
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value
+        if na and na != self.yaml.get("na", None):
+            LOGGER.info(f"Overriding model.yaml na={self.yaml.get('na', None)} with na={na}")
+            self.yaml["na"] = na  # override YAML value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.inplace = self.yaml.get("inplace", True)
@@ -567,13 +571,14 @@ class PoseModel(DetectionModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo11n-pose.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+    def __init__(self, cfg="yolo11n-pose.yaml", ch=3, nc=None, na=None, data_kpt_shape=(None, None), verbose=True):
         """Initialize Ultralytics YOLO Pose model.
 
         Args:
             cfg (str | dict): Model configuration file path or dictionary.
             ch (int): Number of input channels.
             nc (int, optional): Number of classes.
+            na (int, optional): Number of binary attributes.
             data_kpt_shape (tuple): Shape of keypoints data.
             verbose (bool): Whether to display model information.
         """
@@ -582,7 +587,7 @@ class PoseModel(DetectionModel):
         if any(data_kpt_shape) and list(data_kpt_shape) != list(cfg["kpt_shape"]):
             LOGGER.info(f"Overriding model.yaml kpt_shape={cfg['kpt_shape']} with kpt_shape={data_kpt_shape}")
             cfg["kpt_shape"] = data_kpt_shape
-        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        super().__init__(cfg=cfg, ch=ch, nc=nc, na=na, verbose=verbose)
 
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
@@ -1499,7 +1504,7 @@ def parse_model(d, ch, verbose=True):
     # Args
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
-    nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
+    nc, na, act, scales = (d.get(x) for x in ("nc", "na", "activation", "scales"))
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
     if scales:

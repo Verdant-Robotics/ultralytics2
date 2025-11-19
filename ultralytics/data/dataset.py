@@ -101,6 +101,8 @@ class YOLODataset(BaseDataset):
         desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
         total = len(self.im_files)
         nkpt, ndim = self.data.get("kpt_shape", (0, 0))
+        num_classes = len(self.data['names'])
+        num_attributes = len(self.data['attribute_names']) if 'attribute_names' in self.data else 0
         if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):
             raise ValueError(
                 "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
@@ -114,14 +116,15 @@ class YOLODataset(BaseDataset):
                     self.label_files,
                     repeat(self.prefix),
                     repeat(self.use_keypoints),
-                    repeat(len(self.data["names"])),
+                    repeat(num_classes),
+                    repeat(num_attributes),
                     repeat(nkpt),
                     repeat(ndim),
                     repeat(self.single_cls),
                 ),
             )
             pbar = TQDM(results, desc=desc, total=total)
-            for im_file, lb, shape, segments, keypoint, ignore_kpt, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+            for im_file, lb, shape, segments, keypoints, ignore_kpt, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
                 nf += nf_f
                 ne += ne_f
@@ -131,10 +134,10 @@ class YOLODataset(BaseDataset):
                         {
                             "im_file": im_file,
                             "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
+                            "cls": lb[:, 0:1 + num_attributes],  # n, 1 + na
+                            "bboxes": lb[:, 1 + num_attributes:1 + num_attributes + 4],  # n, 4
                             "segments": segments,
-                            "keypoints": keypoint,
+                            "keypoints": keypoints,
                             "ignore_kpt": ignore_kpt,
                             "normalized": True,
                             "bbox_format": "xywh",
@@ -299,7 +302,7 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "attributes", "segments", "obb"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])

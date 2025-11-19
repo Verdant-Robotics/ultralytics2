@@ -92,6 +92,7 @@ class DetectionValidator(BaseValidator):
         self.args.save_json |= self.args.val and (self.is_coco or self.is_lvis) and not self.training  # run final val
         self.names = model.names
         self.nc = len(model.names)
+        self.kpt_shape = getattr(model, "kpt_shape", None)
         self.end2end = getattr(model, "end2end", False)
         self.seen = 0
         self.jdict = []
