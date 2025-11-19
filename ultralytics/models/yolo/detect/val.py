@@ -138,7 +138,6 @@ class DetectionValidator(BaseValidator):
         """
         idx = batch["batch_idx"] == si
         cls = batch["cls"][idx].squeeze(-1)
-        # TODO: Add attributes?
         bbox = batch["bboxes"][idx]
         ori_shape = batch["ori_shape"][si]
         imgsz = batch["img"].shape[2:]
