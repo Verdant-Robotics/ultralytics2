@@ -19,6 +19,7 @@ from ultralytics.nn.tasks import (
     WorldModel,
     YOLOEModel,
     YOLOESegModel,
+    PoseSegModel,
 )
 from ultralytics.utils import ROOT, YAML
 
@@ -113,6 +114,12 @@ class YOLO(Model):
                 "trainer": yolo.pose.PoseTrainer,
                 "validator": yolo.pose.PoseValidator,
                 "predictor": yolo.pose.PosePredictor,
+            },
+            'pose-segmentation' : {
+                'model': PoseSegModel,
+                'trainer': yolo.pose_seg.PoseSegTrainer,
+                'validator': yolo.pose_seg.PoseSegValidator,
+                'predictor': yolo.pose_seg.PoseSegPredictor,
             },
             "obb": {
                 "model": OBBModel,

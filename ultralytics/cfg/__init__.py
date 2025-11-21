@@ -53,13 +53,14 @@ SOLUTION_MAP = {
 
 # Define valid tasks and modes
 MODES = frozenset({"train", "val", "predict", "export", "track", "benchmark"})
-TASKS = frozenset({"detect", "segment", "classify", "pose", "obb"})
+TASKS = frozenset({"detect", "segment", "classify", "pose", "obb", "pose-segmentation"})
 TASK2DATA = {
     "detect": "coco8.yaml",
     "segment": "coco8-seg.yaml",
     "classify": "imagenet10",
     "pose": "coco8-pose.yaml",
     "obb": "dota8.yaml",
+    'pose-segmentation': 'coco8-pose.yaml'
 }
 TASK2MODEL = {
     "detect": "yolo11n.pt",
@@ -67,6 +68,7 @@ TASK2MODEL = {
     "classify": "yolo11n-cls.pt",
     "pose": "yolo11n-pose.pt",
     "obb": "yolo11n-obb.pt",
+    'pose-segmentation': 'yolo11n-pose-seg.pt'
 }
 TASK2METRIC = {
     "detect": "metrics/mAP50-95(B)",
@@ -74,6 +76,7 @@ TASK2METRIC = {
     "classify": "metrics/accuracy_top1",
     "pose": "metrics/mAP50-95(P)",
     "obb": "metrics/mAP50-95(B)",
+    'pose-segmentation': 'metrics/mAP50-95(P)'
 }
 
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []

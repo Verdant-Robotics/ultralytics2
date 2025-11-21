@@ -3,7 +3,7 @@
 # Global configuration YAML with settings and hyperparameters for YOLO training, validation, prediction and export
 # For documentation see https://docs.ultralytics.com/usage/cfg/
 
-task: detect # (str) YOLO task, i.e. detect, segment, classify, pose, obb
+task: detect # (str) YOLO task, i.e. detect, segment, classify, pose, obb, pose-segmentation
 mode: train # (str) YOLO mode, i.e. train, val, predict, export, track, benchmark
 
 # Train settings -------------------------------------------------------------------------------------------------------
@@ -51,6 +51,7 @@ val: True # (bool) run validation/testing during training
 split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'
 save_json: False # (bool) save results to COCO JSON for external evaluation
 conf: # (float, optional) confidence threshold; defaults: predict=0.25, val=0.001
+seg_conf: 0.5  # (float) minimum segmentation confidence threshold for validation
 iou: 0.7 # (float) IoU threshold used for NMS
 max_det: 300 # (int) maximum number of detections per image
 half: False # (bool) use half precision (FP16) if supported
@@ -101,6 +102,7 @@ warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
 box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) classification loss gain
 dfl: 1.5 # (float) distribution focal loss gain
+seg: 1.0 # (float) segmentation loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 attr: 0.5 # (float) attribute loss gain (binary classification tasks conditioned on class)
@@ -117,6 +119,7 @@ flipud: 0.0 # (float) vertical flip probability
 fliplr: 0.5 # (float) horizontal flip probability
 bgr: 0.0 # (float) RGB↔BGR channel swap probability
 mosaic: 1.0 # (float) mosaic augmentation probability
+shuffle_num: 5  # (int) number of shuffling operations of image
 mixup: 0.0 # (float) MixUp augmentation probability
 cutmix: 0.0 # (float) CutMix augmentation probability
 copy_paste: 0.0 # (float) segmentation copy-paste probability

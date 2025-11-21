@@ -81,7 +81,7 @@ class YOLODataset(BaseDataset):
             **kwargs (Any): Additional keyword arguments for the parent class.
         """
         self.use_segments = task == "segment"
-        self.use_keypoints = task == "pose"
+        self.use_keypoints = task == "pose" or task == "pose-segmentation"
         self.use_obb = task == "obb"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
@@ -268,6 +268,7 @@ class YOLODataset(BaseDataset):
         keypoints = label.pop("keypoints", None)
         bbox_format = label.pop("bbox_format")
         normalized = label.pop("normalized")
+        bboxes_img = label.pop('bboxes_img', None)
 
         # NOTE: do NOT resample oriented boxes
         segment_resamples = 100 if self.use_obb else 1000
@@ -279,7 +280,7 @@ class YOLODataset(BaseDataset):
             segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
         else:
             segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
-        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized, bboxes_img=bboxes_img)
         return label
 
     @staticmethod
@@ -298,12 +299,14 @@ class YOLODataset(BaseDataset):
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats"}:
+            if k in {"img", "text_feats", "is_shuffled"}:
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
             if k in {"masks", "keypoints", "bboxes", "cls", "attributes", "segments", "obb"}:
                 value = torch.cat(value, 0)
+            if k in ["bboxes_img"]:
+                value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])
         for i in range(len(new_batch["batch_idx"])):

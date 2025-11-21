@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect", "PoseSeg"
 
 
 class Detect(nn.Module):
@@ -380,6 +380,102 @@ class Pose(Detect):
                     y[:, 2::ndim].sigmoid_()
                 else:  # Apple macOS14 MPS bug https://github.com/ultralytics/ultralytics/pull/21878
                     y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
+            y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
+            y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+            return y
+
+
+class DetectAndSeg(Detect):
+    def __init__(self, nc=80, na=0, seg_ch_num=1, ch=()):
+        """Initializes the YOLO detection layer with specified number of classes and channels."""
+        super().__init__(nc, na, ch)
+        self.no = nc + self.reg_max * 4 + seg_ch_num + 1 + 1
+        self.seg_ch_num = seg_ch_num
+        c4 = max(16, ch[0] // 4)
+        self.cv_seg = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), nn.Conv2d(c4, 2 + seg_ch_num, 1)) for x in ch) # 2 obj channels + seg clses
+
+    def forward(self, x):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        shape = x[0].shape  # BCHW
+        for i in range(self.nl):  # per detection scale
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i]), self.cv_seg[i](x[i])), 1)
+
+        if self.training:
+            return x
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.export and self.format in ('saved_model', 'pb', 'tflite', 'edgetpu', 'tfjs'):  # avoid TF FlexSplitV ops
+            box = x_cat[:, :self.reg_max * 4]
+            cls = x_cat[:, self.reg_max * 4:self.reg_max * 4 + self.nc]
+            seg_offset = self.reg_max * 4 + self.nc
+            seg_obj0 = x_cat[:, seg_offset : seg_offset+1]
+            seg_obj1 = x_cat[:, seg_offset + 1 : seg_offset+2]
+            seg_clsfy = x_cat[:, seg_offset+2:]
+        else:
+            box, cls, seg_obj0, seg_obj1, seg_clsfy = x_cat.split((self.reg_max * 4, self.nc, 1, 1, self.seg_ch_num), 1)
+
+        dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+
+        if self.export and self.format in ('tflite', 'edgetpu'):
+            # Normalize xywh with image size to mitigate quantization error of TFLite integer models as done in YOLOv5:
+            # https://github.com/ultralytics/yolov5/blob/0c8de3fca4a702f8ff5c435e67f378d1fce70243/models/tf.py#L307-L309
+            # See this PR for details: https://github.com/ultralytics/ultralytics/pull/1695
+            img_h = shape[2] * self.stride[0]
+            img_w = shape[3] * self.stride[0]
+            img_size = torch.tensor([img_w, img_h, img_w, img_h], device=dbox.device).reshape(1, 4, 1)
+            dbox /= img_size
+
+        y = torch.cat((dbox, cls.sigmoid(), seg_obj0.sigmoid(), seg_obj1.sigmoid(), seg_clsfy.sigmoid()), 1) # (B, 4=xyxy, A) (B, nc0,..,nci, A), (B, seg0, ..., segj, A)
+        return y if self.export else (y, x)
+
+
+class PoseSeg(DetectAndSeg):
+    def __init__(self, nc=80, na: int = 0, kpt_shape=(17, 3), seg_ch_num=1, ch=()):
+        """Initialize YOLO network with default parameters and Convolutional Layers."""
+        super().__init__(nc=nc, na=na, ch=ch, seg_ch_num=seg_ch_num)
+        self.kpt_shape = kpt_shape
+        self.nk = kpt_shape[0] * kpt_shape[1]
+        c4 = max(ch[0] // 4, self.nk)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
+        self.detect = DetectAndSeg.forward
+
+
+    def forward(self, x):
+        '''
+        Perform forward pass through YOLO model and return predictions.
+        During training: Assuming 2 seg ch + 2 nc, self.no = 64 (dfl) + 2 (seg) + 2 (cls) = 68
+            x = [P3, P4, P5]
+            Each Pi is (bs, self.no, h_i, w_i), with h_i and w_i being different for each P. e.g 8x8, 4x4, 2x2 corresponding to resolution(self.stride) [8, 16, 32]
+        After training: 
+            x[0] = (bs, 8=xyxy(bbox),cls0,cls1,seg0,seg1, anchors_len) e.g anchors_len = 8x8 + 4x4 + 2x2 = 84
+            x[1] = [P3, P4, P5]
+        '''
+        bs = x[0].shape[0]
+        kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)
+        x = self.detect(self, x)
+        if self.training:
+            return x, kpt
+
+        pred_kpt = self.kpts_decode(bs, kpt)
+        return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
+
+
+    def kpts_decode(self, bs, kpts):
+        """Decodes keypoints."""
+        ndim = self.kpt_shape[1]
+        if self.export:  # required for TFLite export to avoid 'PLACEHOLDER_FOR_GREATER_OP_CODES' bug
+            y = kpts.view(bs, *self.kpt_shape, -1)
+            a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
+            if ndim == 3:
+                a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+            return a.view(bs, self.nk, -1)
+        else:
+            y = kpts.clone()
+            if ndim == 3:
+                y[:, 2::3].sigmoid_()  # inplace sigmoid
             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y

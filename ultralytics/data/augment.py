@@ -2174,6 +2174,11 @@ class Format:
         # Then we can use collate_fn
         if self.batch_idx:
             labels["batch_idx"] = torch.zeros(nl)
+
+        if instances.bboxes_img is not None:
+            bboxes_img = np.ascontiguousarray(instances.bboxes_img.transpose(2, 0, 1))
+            labels['bboxes_img'] = torch.from_numpy(bboxes_img)
+        labels['is_shuffled'] = torch.from_numpy(instances.is_shuffled)
         return labels
 
     def _format_img(self, img: np.ndarray) -> torch.Tensor:
