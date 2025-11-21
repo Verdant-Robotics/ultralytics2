@@ -104,7 +104,6 @@ class BaseValidator:
 
         self.args = get_cfg(overrides=args)
         self.dataloader = dataloader
-        self.model = None
         self.stride = None
         self.data = None
         self.device = None
@@ -150,7 +149,6 @@ class BaseValidator:
             if trainer.args.compile and hasattr(model, "_orig_mod"):
                 model = model._orig_mod  # validate non-compiled original model to avoid issues
             model = model.half() if self.args.half else model.float()
-            self.model = model
             self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
@@ -165,7 +163,6 @@ class BaseValidator:
                 data=self.args.data,
                 fp16=self.args.half,
             )
-            self.model = model
             self.device = model.device  # update device
             self.args.half = model.fp16  # update half
             stride, pt, jit = model.stride, model.pt, model.jit

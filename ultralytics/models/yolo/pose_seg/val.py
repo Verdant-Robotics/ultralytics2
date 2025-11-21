@@ -17,7 +17,7 @@ class PoseSegValidator(PoseValidator):
 
     def init_metrics(self, model):
         super().init_metrics(model)
-        self.seg_ch_num = self.model.seg_ch_num
+        self.seg_ch_num = model.seg_ch_num
 
     def process_seg_result(self, preds):
         """

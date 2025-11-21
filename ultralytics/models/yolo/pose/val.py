@@ -138,9 +138,10 @@ class PoseValidator(DetectionValidator):
             to the next one. The keypoints are extracted from the 'extra' field which contains additional
             task-specific data beyond basic detection.
         """
+        keypoint_size = self.kpt_shape[1]
         preds = super().postprocess(preds)
         for pred in preds:
-            pred["keypoints"] = pred["extra"][:, -3:].reshape(-1, *self.kpt_shape)  # last 3 channels are keypoints
+            pred["keypoints"] = pred["extra"][:, -keypoint_size:]
         return preds
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
