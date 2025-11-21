@@ -220,6 +220,8 @@ class Instances:
         keypoints: np.ndarray = None,
         bbox_format: str = "xywh",
         normalized: bool = True,
+        bboxes_img=None,
+        is_shuffled=np.array([False], dtype=bool)
     ) -> None:
         """Initialize the Instances object with bounding boxes, segments, and keypoints.
 
@@ -234,6 +236,8 @@ class Instances:
         self.keypoints = keypoints
         self.normalized = normalized
         self.segments = segments
+        self.bboxes_img = bboxes_img
+        self.is_shuffled = is_shuffled
 
     def convert_bbox(self, format: str) -> None:
         """Convert bounding box format.
@@ -337,6 +341,8 @@ class Instances:
             keypoints=keypoints,
             bbox_format=bbox_format,
             normalized=self.normalized,
+            bboxes_img=self.bboxes_img,
+            is_shuffled=self.is_shuffled
         )
 
     def flipud(self, h: int) -> None:

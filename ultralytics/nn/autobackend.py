@@ -211,6 +211,8 @@ class AutoBackend(nn.Module):
             # Common PyTorch model processing
             if hasattr(model, "kpt_shape"):
                 kpt_shape = model.kpt_shape  # pose-only
+            if hasattr(model, 'seg_ch_num'):
+                seg_ch_num = model.seg_ch_num  # pose-seg only
             stride = max(int(model.stride.max()), 32)  # model stride
             names = model.module.names if hasattr(model, "module") else model.names  # get class names
             model.half() if fp16 else model.float()
@@ -603,7 +605,7 @@ class AutoBackend(nn.Module):
             metadata = YAML.load(metadata)
         if metadata and isinstance(metadata, dict):
             for k, v in metadata.items():
-                if k in {"stride", "batch", "channels"}:
+                if k in {"stride", "batch", "channels", "seg_ch_num"}:
                     metadata[k] = int(v)
                 elif k in {"imgsz", "names", "kpt_shape", "kpt_names", "args"} and isinstance(v, str):
                     metadata[k] = eval(v)
@@ -617,6 +619,7 @@ class AutoBackend(nn.Module):
             end2end = metadata.get("args", {}).get("nms", False)
             dynamic = metadata.get("args", {}).get("dynamic", dynamic)
             ch = metadata.get("channels", 3)
+            seg_ch_num = metadata.get("seg_ch_num")  # pose-seg only
         elif not (pt or triton or nn_module):
             LOGGER.warning(f"Metadata not found for 'model={w}'")
 

@@ -1011,6 +1011,17 @@ def plot_tune_results(csv_file: str = "tune_results.csv", exclude_zero_fitness_p
     _save_one_file(csv_file.with_name("tune_fitness.png"))
 
 
+def output_to_target(output, max_det=300):
+    """Convert model output to target format [batch_id, class_id, x, y, w, h, conf] for plotting."""
+    targets = []
+    for i, o in enumerate(output):
+        box, conf, cls = o[:max_det, :6].cpu().split((4, 1, 1), 1)
+        j = torch.full((conf.shape[0], 1), i)
+        targets.append(torch.cat((j, cls, ops.xyxy2xywh(box), conf), 1))
+    targets = torch.cat(targets, 0).numpy()
+    return targets[:, 0], targets[:, 1], targets[:, 2:]
+
+
 @plt_settings()
 def feature_visualization(x, module_type: str, stage: int, n: int = 32, save_dir: Path = Path("runs/detect/exp")):
     """Visualize feature maps of a given model module during inference.
@@ -1024,7 +1035,7 @@ def feature_visualization(x, module_type: str, stage: int, n: int = 32, save_dir
     """
     import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
 
-    for m in {"Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder"}:  # all model heads
+    for m in {"Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "PoseSeg"}:  # all model heads
         if m in module_type:
             return
     if isinstance(x, torch.Tensor):

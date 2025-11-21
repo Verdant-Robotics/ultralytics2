@@ -140,7 +140,7 @@ class PoseValidator(DetectionValidator):
         """
         preds = super().postprocess(preds)
         for pred in preds:
-            pred["keypoints"] = pred.pop("extra").view(-1, *self.kpt_shape)  # remove extra if exists
+            pred["keypoints"] = pred["extra"][:, -3:].reshape(-1, *self.kpt_shape)  # last 3 channels are keypoints
         return preds
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
