@@ -49,6 +49,6 @@ class PoseSegTrainer(yolo.detect.DetectionTrainer):
 
     def get_validator(self):
         """Returns an instance of the PoseSegValidator class for validation."""
-        self.loss_names = 'box_loss', 'pose_loss', 'kobj_loss', 'cls_loss', 'dfl_loss', 'attr_loss', 'seg_obj0', 'seg_obj1', 'seg_cls'
+        self.loss_names = 'box_loss', 'pose_loss', 'kobj_loss', 'cls_loss', 'dfl_loss', 'attr_loss', 'seg_obj0', 'seg_obj1'
         return yolo.pose_seg.PoseSegValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))
     

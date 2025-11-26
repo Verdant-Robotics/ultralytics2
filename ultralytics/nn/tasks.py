@@ -82,7 +82,6 @@ from ultralytics.utils.loss import (
     v8PoseLoss,
     v8SegmentationLoss,
     v8PSLPose,
-    v8PSLSegCls,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -655,8 +654,7 @@ class PoseSegModel(PoseModel):
             x1, y1, x2, y2 = gt_bboxes_scaled[d_i, :4]
             b_idx = batch_idx[d_i].long()
             assert 0 <= x1 < x2 <= anchor_W and 0 <= y1 < y2 <= anchor_H, f"Box {gt_bboxes_xyxy[d_i]} with stride {stride} is out of bounds for image of size {(img_W, img_H)}"
-            bboxes_img[b_idx, :, y1:y2, x1:x2] = 0
-            bboxes_img[b_idx, int(gt_cls[d_i]), y1:y2, x1:x2] = 1  # The smaller box has priority
+            bboxes_img[b_idx, int(gt_cls[d_i]), y1:y2, x1:x2] = 1
         return bboxes_img
 
     def _extend_to_all_strides(self, x):
@@ -691,10 +689,9 @@ class PoseSegModel(PoseModel):
         if preds:
             assert self.training is False
             box_kpt_loss = self.calc_box_kpt_loss(preds=preds, batch=batch)
-            seg_cls_loss = self.calc_seg_cls_loss(preds=preds, batch=batch)
-            seg_obj_loss_item = torch.Tensor([0]).to(seg_cls_loss[0].device)  # Object loss can only be computed during training
-            loss_sum = box_kpt_loss[0] + seg_cls_loss[0]
-            loss_items = torch.cat([box_kpt_loss[1], seg_obj_loss_item, seg_obj_loss_item, seg_cls_loss[1]])  # Order should match self.loss_names in pose_seg/train.py
+            seg_obj_loss_item = torch.Tensor([0]).to(box_kpt_loss[0].device)  # Object loss can only be computed during training
+            loss_sum = box_kpt_loss[0]
+            loss_items = torch.cat([box_kpt_loss[1], seg_obj_loss_item, seg_obj_loss_item])  # Order should match self.loss_names in pose_seg/train.py
             return loss_sum, loss_items
 
         anchor_shuffler, img_shuffler = self._get_anchor_and_img_shuffler(batch)
@@ -710,30 +707,29 @@ class PoseSegModel(PoseModel):
         pred_kpts_unshuffled = pred_kpts_combined[:B] if pred_kpts_combined is not None else None
 
         box_kpt_loss = self.calc_box_kpt_loss(preds=(feats_unshuffled, pred_kpts_unshuffled), batch=batch)
-        seg_cls_loss = self.calc_seg_cls_loss(preds=(feats_unshuffled, None), batch=batch)
-        object0_shuffled = feats_shuffled[0].split((self.model[-1].reg_max * 4, self.nc, 1, 1, self.seg_ch_num), 1)[2]
-        object0_deshuffled = anchor_shuffler.unshuffle(object0_shuffled)
-        cls_gt = batch['anchor_level_cls'][0]
-        object0_gt = cls_gt.max(dim=1, keepdim=True).values
+        object0_shuffled = feats_shuffled[0].split((self.model[-1].reg_max * 4, self.nc, self.seg_ch_num, self.seg_ch_num), 1)[2]  # seg_ch_num (obj0; shuffled), seg_ch_num (obj1; unshuffled)
+        object0_deshuffled = anchor_shuffler.unshuffle(object0_shuffled)  # B, seg_ch_num, H, W
+        cls_gt = batch['anchor_level_cls'][0]  # B, C, H, W for the finest grained anchor level
+        object0_gt = cls_gt  # B, C, H, W
         object1_unshuffled = torch.cat(
             [feats.flatten(start_dim=2) for feats in feats_unshuffled], 2
-        ).split((self.model[-1].reg_max * 4, self.nc, 1, 1, self.seg_ch_num), 1)[3]
+        ).split((self.model[-1].reg_max * 4, self.nc, self.seg_ch_num, self.seg_ch_num), 1)[3]
         seg_obj0_loss = self.calc_object0_loss(
-            object0_deshuffled=object0_deshuffled,  # B, 1, H, W
+            object0_deshuffled=object0_deshuffled,  # B, seg_ch_num, H, W
             cls_gt=cls_gt,   # B, C, H, W
         )
         seg_obj1_loss = self.calc_object1_loss(
-            object1_unshuffled=object1_unshuffled,
+            object1_unshuffled=object1_unshuffled,  # B, seg_ch_num, H*W
             object0_deshuffled=object0_deshuffled,
             object0_gt=object0_gt
         )
-        loss_sum = box_kpt_loss[0] + seg_cls_loss[0] + seg_obj0_loss[0] + seg_obj1_loss[0]
-        loss_items = torch.cat([box_kpt_loss[1], seg_obj0_loss[1], seg_obj1_loss[1], seg_cls_loss[1]])  # Order should match self.loss_names in pose_seg/train.py
+        loss_sum = box_kpt_loss[0] + seg_obj0_loss[0] + seg_obj1_loss[0]
+        loss_items = torch.cat([box_kpt_loss[1], seg_obj0_loss[1], seg_obj1_loss[1]])  # Order should match self.loss_names in pose_seg/train.py
         return loss_sum, loss_items
 
     def prepare_object1_pseudo_label(self, object0_deshuffled, object0_gt):
-        object1_pred = object0_deshuffled.detach().sigmoid()
-        foreground_mask = (object0_gt > 0).float()
+        object1_pred = object0_deshuffled.detach().sigmoid()  # B, seg_ch_num, H, W;  C == seg_ch_num
+        foreground_mask = (object0_gt > 0).float()  # B, C, H, W
         object1_pseudo_label = object1_pred * foreground_mask  # B, C, H, W
         col_max = object1_pseudo_label.max(dim=2, keepdim=True).values  # B, C, 1, W
         row_max = object1_pseudo_label.max(dim=3, keepdim=True).values  # B, C, H, 1
@@ -747,23 +743,18 @@ class PoseSegModel(PoseModel):
     def calc_box_kpt_loss(self, preds, batch):
         return self.criterion['bbox_kpt'](preds, batch)
 
-    def calc_seg_cls_loss(self, preds, batch):
-        return self.criterion['seg_cls'](preds, batch)
-
     def calc_object0_loss(self, object0_deshuffled, cls_gt):
         batch_size = cls_gt.shape[0]
         cls_mask = (cls_gt > 0).float()  # B, C, H, W
-        object0_foreground = object0_deshuffled.detach().sigmoid() * cls_mask  # B, C, H, W (distributes)
+        object0_foreground = object0_deshuffled.detach().sigmoid() * cls_mask  # B, C, H, W (distributes); note: C == seg_ch_num
         col_max = object0_foreground.max(dim=2, keepdim=True).values  # B, C, 1, W
         row_max = object0_foreground.max(dim=3, keepdim=True).values  # B, C, H, 1
         normalizer = torch.minimum(col_max, row_max) * cls_mask  # B, C, H, W (distributes)
         cls_positives = (object0_foreground > (0.95 * normalizer)).float() * cls_mask  # B, C, H, W
-        positives = cls_positives.max(dim=1, keepdim=True).values  # B, 1, H, W
-        foreground_mask = cls_mask.max(dim=1, keepdim=True).values  # B, 1, H, W
-        weights = torch.maximum(positives * 1, 1.0 - foreground_mask)  # B, C, H, W
+        weights = torch.maximum(cls_positives * 1, 1.0 - cls_mask)  # B, C, H, W
         loss = self.binary_loss(
             pred=object0_deshuffled,
-            target=positives,
+            target=cls_positives,
             weights=weights,
         )
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
@@ -788,7 +779,6 @@ class PoseSegModel(PoseModel):
     def init_criterion(self):
         return {
             'bbox_kpt': v8PSLPose(self),
-            'seg_cls': v8PSLSegCls(self),
         }
 
 

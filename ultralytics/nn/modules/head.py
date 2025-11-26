@@ -389,10 +389,10 @@ class DetectAndSeg(Detect):
     def __init__(self, nc=80, na=0, seg_ch_num=1, ch=()):
         """Initializes the YOLO detection layer with specified number of classes and channels."""
         super().__init__(nc, na, ch)
-        self.no = nc + self.reg_max * 4 + seg_ch_num + 1 + 1
+        self.no = nc + self.reg_max * 4 + seg_ch_num * 2  # output shape
         self.seg_ch_num = seg_ch_num
         c4 = max(16, ch[0] // 4)
-        self.cv_seg = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), nn.Conv2d(c4, 2 + seg_ch_num, 1)) for x in ch) # 2 obj channels + seg clses
+        self.cv_seg = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), nn.Conv2d(c4, seg_ch_num * 2, 1)) for x in ch) # seg_ch_num (shuffled; obj0) + seg_ch_num (shuffled; obj1)
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
@@ -411,11 +411,10 @@ class DetectAndSeg(Detect):
             box = x_cat[:, :self.reg_max * 4]
             cls = x_cat[:, self.reg_max * 4:self.reg_max * 4 + self.nc]
             seg_offset = self.reg_max * 4 + self.nc
-            seg_obj0 = x_cat[:, seg_offset : seg_offset+1]
-            seg_obj1 = x_cat[:, seg_offset + 1 : seg_offset+2]
-            seg_clsfy = x_cat[:, seg_offset+2:]
+            seg_clsfy0 = x_cat[:, seg_offset : seg_offset + self.seg_ch_num]  # cls channels in obj0; shuffled
+            seg_clsfy1 = x_cat[:, seg_offset + self.seg_ch_num : seg_offset + 2 * self.seg_ch_num]  # cls channels in obj1; unshuffled
         else:
-            box, cls, seg_obj0, seg_obj1, seg_clsfy = x_cat.split((self.reg_max * 4, self.nc, 1, 1, self.seg_ch_num), 1)
+            box, cls, seg_clsfy0, seg_clsfy1 = x_cat.split((self.reg_max * 4, self.nc, self.seg_ch_num, self.seg_ch_num), 1)
 
         dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
 
@@ -428,7 +427,7 @@ class DetectAndSeg(Detect):
             img_size = torch.tensor([img_w, img_h, img_w, img_h], device=dbox.device).reshape(1, 4, 1)
             dbox /= img_size
 
-        y = torch.cat((dbox, cls.sigmoid(), seg_obj0.sigmoid(), seg_obj1.sigmoid(), seg_clsfy.sigmoid()), 1) # (B, 4=xyxy, A) (B, nc0,..,nci, A), (B, seg0, ..., segj, A)
+        y = torch.cat((dbox, cls.sigmoid(), seg_clsfy0.sigmoid(), seg_clsfy1.sigmoid()), 1)
         return y if self.export else (y, x)
 
 

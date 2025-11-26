@@ -704,9 +704,8 @@ class v8PoseSegLoss(v8PoseLoss):
         SCORES = 2
         ATTR = 3
         KPTS = 4
-        SEG_OBJ0 = 5
-        SEG_OBJ1 = 6
-        SEG_CLS = 7
+        OBJ0_CLS = 5
+        OBJ1_CLS = 6
 
     def __init__(self, model):
         super().__init__(model)
@@ -717,16 +716,15 @@ class v8PoseSegLoss(v8PoseLoss):
     def prepare_preds(self, preds):
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         all_preds = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2)
-        pred_distri, pred_scores, pred_attributes, pred_seg_obj0, pred_seg_obj1, pred_seg_cls = all_preds.split((self.reg_max * 4, self.nc, self.na, 1, 1, self.seg_ch_num), 1)  # B, S, A
+        pred_distri, pred_scores, pred_attributes, pred_obj0_cls, pred_obj1_cls = all_preds.split((self.reg_max * 4, self.nc, self.na, self.seg_ch_num, self.seg_ch_num), 1)  # B, S, A
         return {
             self.PredE.FEAT: feats,
             self.PredE.DIST: pred_distri,
             self.PredE.SCORES: pred_scores,
             self.PredE.ATTR: pred_attributes,
             self.PredE.KPTS: pred_kpts,
-            self.PredE.SEG_OBJ0: pred_seg_obj0,
-            self.PredE.SEG_OBJ1: pred_seg_obj1,
-            self.PredE.SEG_CLS: pred_seg_cls
+            self.PredE.OBJ0_CLS: pred_obj0_cls,
+            self.PredE.OBJ1_CLS: pred_obj1_cls
         }
 
     def __call__(self, preds, batch):
@@ -744,31 +742,6 @@ class v8PSLPose(v8PoseSegLoss):
         batch_size = pred_distri.shape[0]
         loss = self.calculate_bbox_kpt_loss(loss=loss, batch=batch, feats=feats, pred_distri=pred_distri, pred_scores=pred_scores, pred_attributes=pred_attributes, pred_kpts=pred_kpts)
         return loss.sum() * batch_size, loss.detach()
-
-
-class v8PSLSegCls(v8PoseSegLoss):
-    '''
-    Calculates the conditional seg cls loss.
-    '''
-    def __init__(self, model):
-        super().__init__(model)
-
-    def __call__(self, preds, batch):
-        pred_seg_cls = self.prepare_preds(preds)[self.PredE.SEG_CLS]
-        anchor_level_cls = batch['anchor_level_cls']
-        target_seg_cls = torch.cat(
-            [x.flatten(start_dim=2) for x in anchor_level_cls], dim=2  # B, C, A
-        )
-        num_labeled_anchors = target_seg_cls.shape[2]
-        pred_seg_cls = pred_seg_cls[:, :, :num_labeled_anchors]  # We only train the anchors with the highest resolution.
-        loss_per_anchor = self.bce(pred_seg_cls, target_seg_cls)  # (B, C, A)
-        zero_mask = (target_seg_cls == 0).all(dim=1).unsqueeze(1)  # B, 1, A
-        _, C, _ = pred_seg_cls.shape
-        zero_mask_expanded = zero_mask.expand(-1, C, -1)
-        loss_per_anchor[zero_mask_expanded] = 0
-        loss = loss_per_anchor.mean().unsqueeze(0) * self.hyp.seg
-        batch_size = pred_seg_cls.shape[0]
-        return loss * batch_size, loss.detach()
 
 
 class v8ClassificationLoss:
