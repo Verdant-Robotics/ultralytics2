@@ -24,7 +24,7 @@ class PoseSegValidator(PoseValidator):
         Input: 
             preds = x_flat, ([P1, P2, P3], kpt)
             Each Pi is (bs, self.no, h_i, w_i), with h_i and w_i being different for each P. e.g 8x8, 4x4, 2x2 corresponding to resolution(self.stride)
-            x_flat = (bs, xyxy(bbox),cls0,..,clsi,seg_obj0,seg_obj1,seg0,...,segj, A) e.g A = anchors_len = 8x8 + 4x4 + 2x2 = 84
+            x_flat = (bs, xyxy(bbox),cls0,..,clsi,obj0_cls0,obj0_cls1,...,obj1_cls0,obj1_cls1,..., A) e.g A = anchors_len = 8x8 + 4x4 + 2x2 = 84
         Output:
             seg_obj (B, 1, A)
             seg_cls (B, seg_ch_num, A)
@@ -33,6 +33,7 @@ class PoseSegValidator(PoseValidator):
         Pi_list = preds[1][0]
         x_flat = preds[0]
         seg_offset = 4 + self.nc
+        #TODO: Fix it for individual classification for pose-segmentation validation
         seg_obj1 = x_flat[:, seg_offset + 1 : seg_offset + 2, :]
         seg_cls = x_flat[:, seg_offset + 2 : seg_offset + 2 + self.seg_ch_num, :]
         return seg_obj1, seg_cls, Pi_list

@@ -24,7 +24,6 @@ class PoseSegTrainer(yolo.detect.DetectionTrainer):
         """Initialize a PoseSegTrainer object with specified configurations and overrides."""
         if overrides is None:
             overrides = {}
-        # overrides['task'] = overrides.get('task', 'pose')
         overrides["task"] = "pose-segmentation"
         super().__init__(cfg, overrides, _callbacks)
 
