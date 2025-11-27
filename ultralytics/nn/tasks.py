@@ -6,9 +6,11 @@ import re
 import types
 from copy import deepcopy
 from pathlib import Path
+from ultralytics.utils.ops import xywh2xyxy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -68,6 +70,7 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    PoseSeg,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -78,6 +81,7 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    v8PSLPose,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -93,6 +97,7 @@ from ultralytics.utils.torch_utils import (
     time_sync,
 )
 
+from ultralytics.data.image_operations import Shuffler
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -402,7 +407,7 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, PoseSeg)) else self.forward(x)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
@@ -592,6 +597,189 @@ class PoseModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
         return v8PoseLoss(self)
+    
+
+class PoseSegModel(PoseModel):
+    def __init__(self, cfg='yolov11n-pose-seg.yaml', ch=3, nc=None, na=None, data_kpt_shape=(None, None), verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, na=na, data_kpt_shape=data_kpt_shape, verbose=verbose)
+        self.seg_ch_num = self.yaml.get('seg_ch_num')
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def _get_anchor_and_img_shuffler(self, batch):
+        min_stride = int(self.stride.min())
+        img_H, img_W = batch['ori_shape'][0][0], batch['ori_shape'][0][1]        
+        anchor_H, anchor_W = img_H // min_stride, img_W // min_stride
+        anchor_shuffler = Shuffler(tile_shape=(anchor_H, anchor_W), num_oper=self.args.shuffle_num)
+        img_shuffler = anchor_shuffler.scale((min_stride, min_stride))
+        return anchor_shuffler, img_shuffler
+
+    def _rasterize_boxes(self, img, gt_bboxes, gt_cls, batch_idx):
+        '''
+        img: B, 3, H, W
+        gt_bboxes: T, 4
+        gt_cls: T, 1
+        batch_idx: maps T to B
+        '''
+        gt_bboxes_xyxy = xywh2xyxy(gt_bboxes)  # T, 4
+        areas = (gt_bboxes_xyxy[:, 2] - gt_bboxes_xyxy[:, 0]) * (gt_bboxes_xyxy[:, 3] - gt_bboxes_xyxy[:, 1])
+        sorted_indices = torch.argsort(areas, descending=True)  # sort by area in descending order
+        return [
+            self._rasterize_sorted_boxes(img, gt_bboxes_xyxy, gt_cls, batch_idx, sorted_indices, stride)
+            for stride in self.stride.long().tolist()
+        ]
+
+    def _rasterize_sorted_boxes(self, img, gt_bboxes_xyxy, gt_cls, batch_idx, sorted_indices, stride):
+        '''
+        img: B, 3, H, W
+        gt_bboxes: T, 4
+        gt_cls: T, 1
+        batch_idx: maps T to B
+        '''
+        B, _, img_H, img_W = img.shape
+        anchor_H, anchor_W = img_H // stride, img_W // stride
+
+        gt_bboxes_scaled = gt_bboxes_xyxy.mul(
+            # The negative sign allows us to perform floor() and ceil() as a single tensor operation.
+            torch.Tensor([-anchor_W, -anchor_H, anchor_W, anchor_H]).to(gt_bboxes_xyxy.device)
+        ).ceil().mul(
+            torch.Tensor([-1.0, -1.0, 1.0, 1.0]).to(gt_bboxes_xyxy.device)
+        ).maximum(
+            torch.zeros(4).to(gt_bboxes_xyxy.device)
+        ).minimum(
+            torch.Tensor([anchor_W, anchor_H, anchor_W, anchor_H]).to(gt_bboxes_xyxy.device)
+        ).long()
+        bboxes_img = torch.zeros((B, self.nc, anchor_H, anchor_W), device=img.device)  # B, C, H, W
+
+        for d_i in sorted_indices:
+            x1, y1, x2, y2 = gt_bboxes_scaled[d_i, :4]
+            b_idx = batch_idx[d_i].long()
+            assert 0 <= x1 < x2 <= anchor_W and 0 <= y1 < y2 <= anchor_H, f"Box {gt_bboxes_xyxy[d_i]} with stride {stride} is out of bounds for image of size {(img_W, img_H)}"
+            bboxes_img[b_idx, int(gt_cls[d_i]), y1:y2, x1:x2] = 1
+        return bboxes_img
+
+    def _extend_to_all_strides(self, x):
+        """
+        Extends a tensor of shape (B, C, H, W), corresponding to the first anchor stride, to all
+        strides. The result is a single tensor where the last two dimensions are flattened."""
+        min_stride = int(self.stride[0])
+        extensions = [
+            F.interpolate(x, scale_factor=min_stride / stride, mode='area')
+            for stride in self.stride[1:]
+        ]
+        return torch.cat(
+            [label.flatten(start_dim=2) for label in [x] + extensions], dim=2
+        )  # B, C, H, W
+
+    def loss(self, batch, preds=None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on
+            preds (torch.Tensor | List[torch.Tensor]): Predictions.
+        """
+        if not hasattr(self, 'criterion'):
+            self.criterion = self.init_criterion()
+        
+        # We pre-rasterize the bounding boxes for each anchor stride.
+        batch['anchor_level_cls'] = self._rasterize_boxes(
+            img=batch['img'], gt_bboxes=batch['bboxes'], batch_idx=batch['batch_idx'], gt_cls=batch['cls']
+        )
+
+        if preds:
+            assert self.training is False
+            box_kpt_loss = self.calc_box_kpt_loss(preds=preds, batch=batch)
+            seg_obj_loss_item = torch.Tensor([0]).to(box_kpt_loss[0].device)  # Object loss can only be computed during training
+            loss_sum = box_kpt_loss[0]
+            loss_items = torch.cat([box_kpt_loss[1], seg_obj_loss_item, seg_obj_loss_item])  # Order should match self.loss_names in pose_seg/train.py
+            return loss_sum, loss_items
+
+        anchor_shuffler, img_shuffler = self._get_anchor_and_img_shuffler(batch)
+        shuffled_img = img_shuffler.shuffle(batch['img'])
+        combined_img = torch.cat((batch['img'], shuffled_img), dim=0)  # 2 x B, 3, H, W
+        preds_combined = self.forward(combined_img)
+
+        feats_combined, pred_kpts_combined = preds_combined if isinstance(preds_combined[0], list) else preds_combined[1]
+
+        B, _, _, _ = batch['img'].shape
+        feats_unshuffled = [feat[:B] for feat in feats_combined]
+        feats_shuffled = [feat[B:] for feat in feats_combined]
+        pred_kpts_unshuffled = pred_kpts_combined[:B] if pred_kpts_combined is not None else None
+
+        box_kpt_loss = self.calc_box_kpt_loss(preds=(feats_unshuffled, pred_kpts_unshuffled), batch=batch)
+        object0_shuffled = feats_shuffled[0].split((self.model[-1].reg_max * 4, self.nc, self.seg_ch_num, self.seg_ch_num), 1)[2]  # seg_ch_num (obj0; shuffled), seg_ch_num (obj1; unshuffled)
+        object0_deshuffled = anchor_shuffler.unshuffle(object0_shuffled)  # B, seg_ch_num, H, W
+        cls_gt = batch['anchor_level_cls'][0]  # B, C, H, W for the finest grained anchor level
+        object0_gt = cls_gt  # B, C, H, W
+        object1_unshuffled = torch.cat(
+            [feats.flatten(start_dim=2) for feats in feats_unshuffled], 2
+        ).split((self.model[-1].reg_max * 4, self.nc, self.seg_ch_num, self.seg_ch_num), 1)[3]
+        seg_obj0_loss = self.calc_object0_loss(
+            object0_deshuffled=object0_deshuffled,  # B, seg_ch_num, H, W
+            cls_gt=cls_gt,   # B, C, H, W
+        )
+        seg_obj1_loss = self.calc_object1_loss(
+            object1_unshuffled=object1_unshuffled,  # B, seg_ch_num, H*W
+            object0_deshuffled=object0_deshuffled,
+            object0_gt=object0_gt
+        )
+        loss_sum = box_kpt_loss[0] + seg_obj0_loss[0] + seg_obj1_loss[0]
+        loss_items = torch.cat([box_kpt_loss[1], seg_obj0_loss[1], seg_obj1_loss[1]])  # Order should match self.loss_names in pose_seg/train.py
+        return loss_sum, loss_items
+
+    def prepare_object1_pseudo_label(self, object0_deshuffled, object0_gt):
+        object1_pred = object0_deshuffled.detach().sigmoid()  # B, seg_ch_num, H, W;  C == seg_ch_num
+        foreground_mask = (object0_gt > 0).float()  # B, C, H, W
+        object1_pseudo_label = object1_pred * foreground_mask  # B, C, H, W
+        col_max = object1_pseudo_label.max(dim=2, keepdim=True).values  # B, C, 1, W
+        row_max = object1_pseudo_label.max(dim=3, keepdim=True).values  # B, C, H, 1
+        normalizer = (torch.minimum(col_max, row_max) + 1e-4) * foreground_mask  # B, C, H, W (distributes)
+        assert normalizer.shape == object1_pseudo_label.shape
+        background_mask = 1.0 - foreground_mask
+        normalizer = torch.maximum(normalizer, background_mask)
+        normalized_pseudo_label = object1_pseudo_label / normalizer
+        return normalized_pseudo_label
+
+    def calc_box_kpt_loss(self, preds, batch):
+        return self.criterion['bbox_kpt'](preds, batch)
+
+    def calc_object0_loss(self, object0_deshuffled, cls_gt):
+        batch_size = cls_gt.shape[0]
+        cls_mask = (cls_gt > 0).float()  # B, C, H, W
+        object0_foreground = object0_deshuffled.detach().sigmoid() * cls_mask  # B, C, H, W (distributes); note: C == seg_ch_num
+        col_max = object0_foreground.max(dim=2, keepdim=True).values  # B, C, 1, W
+        row_max = object0_foreground.max(dim=3, keepdim=True).values  # B, C, H, 1
+        normalizer = torch.minimum(col_max, row_max) * cls_mask  # B, C, H, W (distributes)
+        cls_positives = (object0_foreground > (0.95 * normalizer)).float() * cls_mask  # B, C, H, W
+        weights = torch.maximum(cls_positives * 1, 1.0 - cls_mask)  # B, C, H, W
+        loss = self.binary_loss(
+            pred=object0_deshuffled,
+            target=cls_positives,
+            weights=weights,
+        )
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+
+    def calc_object1_loss(self, object1_unshuffled, object0_deshuffled, object0_gt):
+        batch_size = object0_gt.shape[0]
+        object1_pseudo_gt = self._extend_to_all_strides(
+            self.prepare_object1_pseudo_label(object0_deshuffled, object0_gt)
+        )
+        loss = self.binary_loss(
+            pred=object1_unshuffled,
+            target=object1_pseudo_gt
+        )
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+
+    def binary_loss(self, pred, target, weights=None):
+        loss_per_anchor = self.bce(pred, target)
+        if weights is not None:
+            loss_per_anchor *= weights
+        return loss_per_anchor.mean() * self.args.seg
+
+    def init_criterion(self):
+        return {
+            'bbox_kpt': v8PSLPose(self),
+        }
 
 
 class ClassificationModel(BaseModel):
@@ -1504,7 +1692,7 @@ def parse_model(d, ch, verbose=True):
     # Args
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
-    nc, na, act, scales = (d.get(x) for x in ("nc", "na", "activation", "scales"))
+    nc, na, seg_ch_num, act, scales = (d.get(x) for x in ("nc", "na", "seg_ch_num", "activation", "scales"))
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
     if scales:
@@ -1629,12 +1817,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, PoseSeg}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, PoseSeg}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1726,6 +1914,8 @@ def guess_model_task(model):
             return "pose"
         if m == "obb":
             return "obb"
+        if m == "poseseg":
+            return "pose-segmentation"
 
     # Guess from model cfg
     if isinstance(model, dict):

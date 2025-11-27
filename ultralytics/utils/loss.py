@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from enum import Enum
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -694,6 +695,53 @@ class v8PoseLoss(v8DetectionLoss):
                 kpts_obj_loss = self.bce_pose(pred_kpt[..., 2], kpt_mask.float())  # keypoint obj loss
 
         return kpts_loss, kpts_obj_loss
+    
+
+class v8PoseSegLoss(v8PoseLoss):
+    class PredE(Enum):
+        FEAT = 0
+        DIST = 1
+        SCORES = 2
+        ATTR = 3
+        KPTS = 4
+        OBJ0_CLS = 5
+        OBJ1_CLS = 6
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.seg_ch_num = model.model[-1].seg_ch_num
+        self.no = model.model[-1].no
+
+    def prepare_preds(self, preds):
+        feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
+        all_preds = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2)
+        pred_distri, pred_scores, pred_attributes, pred_obj0_cls, pred_obj1_cls = all_preds.split((self.reg_max * 4, self.nc, self.na, self.seg_ch_num, self.seg_ch_num), 1)  # B, S, A
+        return {
+            self.PredE.FEAT: feats,
+            self.PredE.DIST: pred_distri,
+            self.PredE.SCORES: pred_scores,
+            self.PredE.ATTR: pred_attributes,
+            self.PredE.KPTS: pred_kpts,
+            self.PredE.OBJ0_CLS: pred_obj0_cls,
+            self.PredE.OBJ1_CLS: pred_obj1_cls
+        }
+
+    def __call__(self, preds, batch):
+        return NotImplementedError
+
+
+class v8PSLPose(v8PoseSegLoss):
+    def __init__(self, model):
+        super().__init__(model)
+
+    def __call__(self, preds, batch):
+        loss = torch.zeros(6, device=self.device)  # box, cls, attributes, dfl, kpt_location, kpt_visibility
+        preds_dict = self.prepare_preds(preds)
+        feats, pred_distri, pred_scores, pred_attributes, pred_kpts = preds_dict[self.PredE.FEAT], preds_dict[self.PredE.DIST], preds_dict[self.PredE.SCORES], preds_dict[self.PredE.ATTR], preds_dict[self.PredE.KPTS]
+        batch_size = pred_distri.shape[0]
+        loss = self.calculate_bbox_kpt_loss(loss=loss, batch=batch, feats=feats, pred_distri=pred_distri, pred_scores=pred_scores, pred_attributes=pred_attributes, pred_kpts=pred_kpts)
+        return loss.sum() * batch_size, loss.detach()
 
 
 class v8ClassificationLoss:

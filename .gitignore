@@ -174,3 +174,6 @@ pnnx*
 
 # calibration image
 calibration_*.npy
+
+# Trained artifacts
+training_utils/YOLO11/
