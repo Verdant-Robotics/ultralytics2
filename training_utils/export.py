@@ -21,7 +21,6 @@ def Export(checkpoint_file_path, training_imgsz=768):
     path = model.export(format="onnx", imgsz=[2144, 4096], opset=12)
     os.system(f"mv {path} {base_path}/{prefix}_full_frame.onnx")
 
-    # Use the training image size for the default export
     path = model.export(format="onnx", imgsz=[training_imgsz, training_imgsz], opset=12)
 
 
