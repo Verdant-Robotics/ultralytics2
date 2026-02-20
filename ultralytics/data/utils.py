@@ -226,8 +226,8 @@ def verify_image_label(args: tuple) -> list:
                     else:
                         assert lb.shape[1] == num_expected_columns, f'Found {lb.shape[1]} columns. Expected {num_expected_columns}'
                         ignore_kpt = False
-                    assert keypoints.max() <= 1, f'Keypoint coordinates should be in [0, 1]. Found {keypoints[keypoints > 1]}'
-                    assert keypoints.min() >= 0, f'Keypoint coordinates should be in [0, 1]. Found {keypoints[keypoints < 0]}'
+                        assert keypoints.max() <= 1, f'Keypoint coordinates should be in [0, 1]. Found {keypoints[keypoints > 1]}'
+                        assert keypoints.min() >= 0, f'Keypoint coordinates should be in [0, 1]. Found {keypoints[keypoints < 0]}'
 
                 # All labels
                 class_labels = lb[:, 0]
