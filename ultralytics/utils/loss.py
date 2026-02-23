@@ -250,24 +250,28 @@ class v8DetectionLoss:
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
-    def calculate_attribute_loss(self, batch, pred_attributes, target_gt_idx):
+    def calculate_attribute_loss(self, batch, pred_attributes, target_gt_idx, fg_mask):
+        """
+        pred_attributes: (bs, n_anchors, n_attributes)
+        target_gt_idx: (bs, n_anchors) For each anchor, index of the assigned ground truth object.
+        fg_mask: (bs, n_anchors) Boolean mask indicating which anchors have been matched to a gt object.
+        """
         flat_attributes = batch['attributes'].to(self.device).float()  # (n_targets_in_batch, n_attributes)
         batch_idx = batch['batch_idx'].view(-1, 1)
         batch_size = pred_attributes.shape[0]
         dtype = pred_attributes.dtype
-        attributes = self.unflatten_batch(flat_attributes, batch_idx, batch_size)
-        # print(f"attributes shape: {attributes.shape}, attributes type: {attributes.dtype}")
 
+        # attributes, attribute_labels, attribute_mask: (bs, max_objects_per_image, n_attributes)
+        attributes = self.unflatten_batch(flat_attributes, batch_idx, batch_size)
         attribute_labels = torch.clamp(attributes, 0, 1).to(dtype=dtype)
-        attribute_mask = (attributes >= 0)  # -1 means ignore
-        # We want:
-        # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a], attr]
-        # We expand target_gt_idx to size (bs, n_anchors, n_attributes) and use scatter_() to set
-        # target_attributes[b, a, attr] = attributes[b, target_gt_idx[b, a, attr], attr]
+        attribute_mask = (attributes >= 0)  # -1 means ignore (note that filler targets are 0)
         num_attributes = attribute_labels.shape[2]  # Number of attributes per object
-        target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).expand(-1, -1, num_attributes)
+        target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).expand(-1, -1, num_attributes)  # (bs, n_anchors, n_attributes)
         anchor_attributes = torch.gather(attribute_labels, 1, target_gt_idx_expanded)
-        anchor_attribute_mask = torch.gather(attribute_mask, 1, target_gt_idx_expanded)
+        anchor_attribute_mask = torch.minimum(
+            torch.gather(attribute_mask, 1, target_gt_idx_expanded),
+            fg_mask.unsqueeze(-1).expand(-1, -1, num_attributes),  # Removes unassigned anchors
+        )
 
         attribute_losses = F.binary_cross_entropy_with_logits(
             pred_attributes,
@@ -308,6 +312,7 @@ class v8DetectionLoss:
         # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
         # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
+        # target_scores: (b, n_anchors, nc) 1-hot class label or 0 if the anchor is not matched
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
@@ -337,7 +342,7 @@ class v8DetectionLoss:
             )
 
         if 'attributes' in batch:
-            loss[3] = self.calculate_attribute_loss(batch, pred_attributes, target_gt_idx)
+            loss[3] = self.calculate_attribute_loss(batch, pred_attributes, target_gt_idx, fg_mask)
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
@@ -598,7 +603,7 @@ class v8PoseLoss(v8DetectionLoss):
                                                              stride_tensor, target_bboxes, pred_kpts, batch['ignore_kpt'])
 
             if 'attributes' in batch:
-                loss[5] = self.calculate_attribute_loss(batch, pred_attributes, target_gt_idx)
+                loss[5] = self.calculate_attribute_loss(batch, pred_attributes, target_gt_idx, fg_mask)
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.pose  # pose gain
