@@ -23,11 +23,13 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--patience", type=int, default=50, help="Number of epochs triggering early stopping when no improvement")
     parser.add_argument("-s", "--batch-size", type=int, default=128, help="Batch size for training")
     parser.add_argument("-b", "--disable-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("-i", "--imgsz", type=int, default=768, help="Image size for training and ONNX export (default: 768)")
 
     args = parser.parse_args()
 
     print(f"Model weights initialized from: {args.load if args.load else 'scratch'}")
     print(f"Learning rate: {args.learning_rate}, Epochs: {args.epochs}, Patience: {args.patience}, Batch size: {args.batch_size}")
+    print(f"Image size for training and ONNX export: {args.imgsz}")
 
     PrepareDataset(coco_classes_file, dataset_yaml_path, training_task)
 
@@ -54,7 +56,7 @@ if __name__ == "__main__":
         fliplr=0.5,
         scale=0.2,
         mosaic=0.0, # Please set this to 0.0 TODO: Fix the issue with mosaic and keypoint detection
-        imgsz=768,
+        imgsz=args.imgsz,
         seed=1,
         batch=args.batch_size,
         name=experiment_name,
@@ -64,5 +66,5 @@ if __name__ == "__main__":
 
     print("Training completed. Exporting the model by converting checkpoints to ONNX format...")
     latest_weights_dir = GetLatestWeightsDir()
-    Export(f"{latest_weights_dir}/best.pt")
-    Export(f"{latest_weights_dir}/last.pt")
+    Export(f"{latest_weights_dir}/best.pt", training_imgsz=args.imgsz)
+    Export(f"{latest_weights_dir}/last.pt", training_imgsz=args.imgsz)

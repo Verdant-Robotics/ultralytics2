@@ -5,7 +5,7 @@ import os
 import argparse
 
 
-def Export(checkpoint_file_path):
+def Export(checkpoint_file_path, training_imgsz=768):
     if os.path.exists(checkpoint_file_path):
         model = GiveModel(checkpoint_file_path)
     else:
@@ -21,7 +21,7 @@ def Export(checkpoint_file_path):
     path = model.export(format="onnx", imgsz=[2144, 4096], opset=12)
     os.system(f"mv {path} {base_path}/{prefix}_full_frame.onnx")
 
-    path = model.export(format="onnx", imgsz=[768, 768], opset=12)
+    path = model.export(format="onnx", imgsz=[training_imgsz, training_imgsz], opset=12)
 
 
 if __name__ == "__main__":
@@ -32,6 +32,11 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="Path to the model weight checkpoint; This model will be exported")
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=768,
+        help="Image size for the default ONNX export (default: 768)")
 
     args = parser.parse_args()
-    Export(args.checkpoint_path)
+    Export(args.checkpoint_path, training_imgsz=args.imgsz)
