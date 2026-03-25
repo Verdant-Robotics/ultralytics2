@@ -10,6 +10,7 @@ from training_utils import (
     training_task,
     experiment_name,
 )
+from training_utils.family_sampler import FamilyPoseTrainer
 import os
 import argparse
 from export import Export
@@ -23,6 +24,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--patience", type=int, default=50, help="Number of epochs triggering early stopping when no improvement")
     parser.add_argument("-s", "--batch-size", type=int, default=128, help="Batch size for training")
     parser.add_argument("-b", "--disable-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("-f", "--family", action="store_true", help="Use family-balanced batch sampling (requires family subdir dataset structure)")
 
     args = parser.parse_args()
 
@@ -43,7 +45,10 @@ if __name__ == "__main__":
     if args.disable_wandb:
         os.environ['WANDB_MODE'] = 'disabled'
 
+    trainer = FamilyPoseTrainer if args.family else None
+
     model.train(
+        trainer=trainer,
         task=training_task,
         data="verdant.yaml",
         optimizer='SGD',
