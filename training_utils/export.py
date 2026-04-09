@@ -21,6 +21,9 @@ def Export(checkpoint_file_path):
     path = model.export(format="onnx", imgsz=[2144, 4096], opset=12)
     os.system(f"mv {path} {base_path}/{prefix}_full_frame.onnx")
 
+    path = model.export(format="onnx", imgsz=[2144, 320], opset=12)
+    os.system(f"mv {path} {base_path}/{prefix}_full_height_narrow.onnx")
+
     path = model.export(format="onnx", imgsz=[768, 768], opset=12)
 
 
