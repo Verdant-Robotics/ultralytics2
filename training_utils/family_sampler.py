@@ -13,7 +13,7 @@ from ultralytics.utils.torch_utils import torch_distributed_zero_first
 
 
 class FamilyBatchSampler(Sampler):
-    """Yields batches where each batch contains N images from M randomly sampled families.
+    """Yields batches where each batch contains N images per GPU from M randomly sampled families.
 
     Each batch is structured as M randomly sampled family blocks of N_global images each:
         e.g. [fam0 x N_global | fam1 x N_global | ... | famM-1 x N_global]
@@ -97,7 +97,7 @@ class FamilyBatchSampler(Sampler):
 
 
 class FamilyDataset:
-    """Wraps a dataset to add family index to each sample.
+    """Wraps a dataset to add family index to each data sample in each batch.
 
     Family index is an integer identifying which family an image belongs to.
     A tensor of family indices of images can be retrieved by "family_idx" key.
@@ -127,7 +127,7 @@ class FamilyDataset:
         return getattr(self._dataset, name)
 
     def collate_fn(self, batch: list[dict]) -> dict:
-        """Collate samples, stacking family_idx as a tensor alongside standard fields."""
+        """Collate samples, stacking family_idx as a tensor"""
         family_indices = [b.pop("family_idx") for b in batch]
         collated = self._base_collate_fn(batch)
         collated["family_idx"] = torch.stack(family_indices)
@@ -150,13 +150,13 @@ class FamilyPoseTrainer(PoseTrainer):
         with torch_distributed_zero_first(rank):
             dataset = self.build_dataset(dataset_path, mode, batch_size)
 
+        # Build a dataset
         n_gpus = self.world_size if rank != -1 else 1
         total_batch_size = batch_size * n_gpus
         batch_sampler = FamilyBatchSampler(dataset.im_files, total_batch_size, rank=rank, n_gpus=n_gpus, seed=self.args.seed)
         dataset = FamilyDataset(dataset, batch_sampler.family_indices)
 
-        nd = torch.cuda.device_count()
-        nw = min(os.cpu_count() // max(nd, 1), self.args.workers)
+        nw = min(os.cpu_count() // max(self.world_size, 1), self.args.workers)
 
         generator = torch.Generator()
         generator.manual_seed(self.args.seed)
@@ -165,7 +165,7 @@ class FamilyPoseTrainer(PoseTrainer):
             dataset=dataset,
             batch_sampler=batch_sampler,
             num_workers=nw,
-            pin_memory=nd > 0,
+            pin_memory=torch.cuda.is_available(),
             collate_fn=dataset.collate_fn,
             worker_init_fn=seed_worker,
             generator=generator,

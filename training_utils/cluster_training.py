@@ -185,12 +185,14 @@ class ClusterPoseLoss(v8PoseLoss):
         target_gt_idx = self._assignment_cache["target_gt_idx"]  # (B, n_grid_points)
         features = self.cached_features["features"].permute(0, 2, 1)  # (B, n_grid_points, C)
         B = fg_mask.shape[0]
-
-        # Map cluster labels from GT boxes onto grid points
         flat_cluster = batch["cluster"].to(self.device)          # (N_total,)
+
+        # Maps boxes to clusters
         gt_clusters_padded = self._unflatten_cluster(
             flat_cluster, batch["batch_idx"], B
         )                                                        # (B, n_max_boxes)
+        
+        # Maps grid points to clusters (points to boxes to grid points)
         cluster_per_anchor = torch.gather(gt_clusters_padded, 1, target_gt_idx)  # (B, n_grid_points)
 
         cluster_per_fg = cluster_per_anchor[fg_mask]             # (n_fg,)
