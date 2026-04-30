@@ -670,6 +670,15 @@ class PoseSegModel(PoseModel):
             [label.flatten(start_dim=2) for label in [x] + extensions], dim=2
         )  # B, C, H, W
 
+    def _inflate(self, x):
+        """Inflates a binary tensor of shape (B, C, H, W) by one pixel in the height and width dimensions."""
+        inflated = x.clone()
+        inflated[:, :, 1:, :] = torch.maximum(inflated[:, :, 1:, :], x[:, :, :-1, :])  # shift down
+        inflated[:, :, :-1, :] = torch.maximum(inflated[:, :, :-1, :], x[:, :, 1:, :])  # shift up
+        inflated[:, :, :, 1:] = torch.maximum(inflated[:, :, :, 1:], x[:, :, :, :-1])  # shift right
+        inflated[:, :, :, :-1] = torch.maximum(inflated[:, :, :, :-1], x[:, :, :, 1:])  # shift left
+        return inflated
+
     def loss(self, batch, preds=None):
         """
         Compute loss.
@@ -751,10 +760,11 @@ class PoseSegModel(PoseModel):
         row_max = object0_foreground.max(dim=3, keepdim=True).values  # B, C, H, 1
         normalizer = torch.minimum(col_max, row_max) * cls_mask  # B, C, H, W (distributes)
         cls_positives = (object0_foreground > (0.95 * normalizer)).float() * cls_mask  # B, C, H, W
-        weights = torch.maximum(cls_positives * 1, 1.0 - cls_mask)  # B, C, H, W
+        cls_positives_inflated = self._inflate(cls_positives) * cls_mask  # B, C, H, W
+        weights = torch.maximum(torch.maximum(cls_positives * 1, cls_positives_inflated * 0.1), 1.0 - cls_mask)  # B, C, H, W
         loss = self.binary_loss(
             pred=object0_deshuffled,
-            target=cls_positives,
+            target=cls_positives_inflated,  # Or, equivalently, cls_mask
             weights=weights,
         )
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
