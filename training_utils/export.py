@@ -10,6 +10,7 @@ from ultralytics.utils import LOGGER
 _EXPORT_SIZES = [
     ([2144, 768],  "_full_height"),
     ([2144, 4096], "_full_frame"),
+    ([2144, 320],  "_full_height_narrow"),
     ([768, 768],   ""),
 ]
 
