@@ -1,3 +1,4 @@
+import math
 import os
 import random
 from collections import defaultdict
@@ -50,9 +51,9 @@ class FamilyBatchSampler(Sampler):
 
         n_families = len(self.families)
         per_gpu_batch_size = batch_size // max(n_gpus, 1)
-        self.N = max(per_gpu_batch_size // n_families, 3)  # number of images per family per batch per GPU
-        self.N_global = self.N * max(n_gpus, 1)            # number of images per family per batch across all GPUs
-        self.M = min(n_families, per_gpu_batch_size // self.N)  # number of families per batch
+        self.num_imgs_family = max(per_gpu_batch_size // n_families, 3)  # number of images per family per batch per GPU
+        self.num_imgs_family_global = self.num_imgs_family * max(n_gpus, 1)  # number of images per family per batch across all GPUs
+        self.num_families = min(n_families, per_gpu_batch_size // self.num_imgs_family)  # number of families per batch
 
     def set_epoch(self, epoch: int) -> None:
         """Call once per epoch so each epoch gets a different shuffle order."""
@@ -65,31 +66,32 @@ class FamilyBatchSampler(Sampler):
         img_indices_map = {f: rng.sample(indices, len(indices)) for f, indices in self.family_indices.items()}
 
         # Build a family queue that guarantees every family appears at least once per epoch
-        shuffled_families = rng.sample(self.families, len(self.families))
-        num_families_epoch = self.n_batches * self.M  # total number of families needed per epoch                                                                                                                                                               
-        family_queue = [shuffled_families[i % len(self.families)] for i in range(num_families_epoch)]  
-
+        family_queue = []                                                                                                                                                                                                                                               
+        while len(family_queue) < self.n_batches * self.num_families:
+            family_queue.extend(rng.sample(self.families, len(self.families)))                                                                                                                                                                                          
+        family_queue = family_queue[:self.n_batches * self.num_families]
+                                                                   
         for i in range(self.n_batches):
-            families_batch = family_queue[i * self.M : (i + 1) * self.M]
+            families_batch = family_queue[i * self.num_families : (i + 1) * self.num_families]
 
             # Build global batch
             global_batch = []
             for family in families_batch:
                 img_indices_family = img_indices_map[family]
-                if len(img_indices_family) < self.N_global:
+                if len(img_indices_family) < self.num_imgs_family_global:
                     # Upsample if not enough images for this family
-                    img_indices_family += rng.choices(self.family_indices[family], k=(self.N_global - len(img_indices_family)))
-                global_batch.extend(img_indices_family[:self.N_global])
-                img_indices_map[family] = img_indices_family[self.N_global:]
+                    img_indices_family += rng.choices(self.family_indices[family], k=(self.num_imgs_family_global - len(img_indices_family)))
+                global_batch.extend(img_indices_family[:self.num_imgs_family_global])
+                img_indices_map[family] = img_indices_family[self.num_imgs_family_global:]
 
             if self.rank == -1:  # single GPU
                 yield global_batch
             else:
                 # Each GPU takes its N-sized slice from each family block
                 per_gpu = []
-                for fam_idx in range(self.M):
-                    start = fam_idx * self.N_global + self.rank * self.N
-                    per_gpu.extend(global_batch[start : start + self.N])
+                for fam_idx in range(self.num_families):
+                    start = fam_idx * self.num_imgs_family_global + self.rank * self.num_imgs_family
+                    per_gpu.extend(global_batch[start : start + self.num_imgs_family])
                 yield per_gpu
 
     def __len__(self) -> int:
@@ -106,7 +108,6 @@ class FamilyDataset:
 
     def __init__(self, dataset, family_indices: dict[str, list[int]]):
         self._dataset = dataset
-        self._base_collate_fn = getattr(dataset, "collate_fn", None)
 
         # Map image index to family
         self._img_to_family_map: dict[int, int] = {}
@@ -129,7 +130,7 @@ class FamilyDataset:
     def collate_fn(self, batch: list[dict]) -> dict:
         """Collate samples, stacking family_idx as a tensor"""
         family_indices = [b.pop("family_idx") for b in batch]
-        collated = self._base_collate_fn(batch)
+        collated = self._dataset.collate_fn(batch)
         collated["family_idx"] = torch.stack(family_indices)
         return collated
 
@@ -156,7 +157,7 @@ class FamilyPoseTrainer(PoseTrainer):
         batch_sampler = FamilyBatchSampler(dataset.im_files, total_batch_size, rank=rank, n_gpus=n_gpus, seed=self.args.seed)
         dataset = FamilyDataset(dataset, batch_sampler.family_indices)
 
-        nw = min(os.cpu_count() // max(self.world_size, 1), self.args.workers)
+        num_workers = min(os.cpu_count() // max(self.world_size, 1), self.args.workers)
 
         generator = torch.Generator()
         generator.manual_seed(self.args.seed)
@@ -164,7 +165,7 @@ class FamilyPoseTrainer(PoseTrainer):
         return InfiniteDataLoader(
             dataset=dataset,
             batch_sampler=batch_sampler,
-            num_workers=nw,
+            num_workers=num_workers,
             pin_memory=torch.cuda.is_available(),
             collate_fn=dataset.collate_fn,
             worker_init_fn=seed_worker,

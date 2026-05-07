@@ -4,12 +4,13 @@ from training_utils import (
 import os
 import argparse
 import torch
+from ultralytics.utils import LOGGER
 
 
 _EXPORT_SIZES = [
-    ([768, 768],   ""),
     ([2144, 768],  "_full_height"),
     ([2144, 4096], "_full_frame"),
+    ([768, 768],   ""),
 ]
 
 
@@ -21,18 +22,11 @@ def Export(checkpoint_file_path):
         exit(1)
 
     prefix = os.path.splitext(os.path.basename(checkpoint_file_path))[0]
-
     base_path, _ = os.path.split(checkpoint_file_path)
-    path = model.export(format="onnx", imgsz=[2144, 768], opset=12)
-    os.system(f"mv {path} {base_path}/{prefix}_full_height.onnx")
 
-    path = model.export(format="onnx", imgsz=[2144, 4096], opset=12)
-    os.system(f"mv {path} {base_path}/{prefix}_full_frame.onnx")
-
-    path = model.export(format="onnx", imgsz=[2144, 320], opset=12)
-    os.system(f"mv {path} {base_path}/{prefix}_full_height_narrow.onnx")
-
-    path = model.export(format="onnx", imgsz=[768, 768], opset=12)
+    for imgsz, suffix in _EXPORT_SIZES:
+        path = model.export(format="onnx", imgsz=imgsz, opset=12)
+        os.system(f"mv {path} {base_path}/{prefix}{suffix}.onnx")
 
 
 def ExportCluster(checkpoint_file_path):
@@ -56,10 +50,7 @@ def ExportCluster(checkpoint_file_path):
     model = GiveModel(checkpoint_file_path)
     base = unwrap_model(model.model)
 
-    if not hasattr(base, "embedding_head"):
-        print("[INFO] No embedding_head found, falling back to standard Export")
-        Export(checkpoint_file_path)
-        return
+    assert hasattr(base, "embedding_head"), "Model does not have an embedding head."
 
     base.eval()
     detect_head = base.model[-1]
@@ -80,7 +71,7 @@ def ExportCluster(checkpoint_file_path):
     yaml_dict = getattr(inner_model, "yaml", {}) or {}
     data = (model.overrides or {}).get("data", "")
     base_metadata = {
-        "description": f"Ultralytics model{f' trained on {data}' if data else ''}",
+        "description": f"Ultralytics model{' trained on ' + data if data else ''}",
         "author": "Ultralytics",
         "date": datetime.now().isoformat(),
         "version": __version__,
@@ -114,7 +105,7 @@ def ExportCluster(checkpoint_file_path):
             import onnxslim
             model_onnx = onnxslim.slim(model_onnx)
         except Exception as e:
-            print(f"[WARNING] onnxslim simplifier failure: {e}")
+            LOGGER.warning(f"onnxslim simplifier failure: {e}")
         for k, v in metadata.items():
             prop = model_onnx.metadata_props.add()
             prop.key, prop.value = k, str(v)
@@ -130,6 +121,13 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="Path to the model weight checkpoint; This model will be exported")
-
+    parser.add_argument(
+        "--cluster",
+        action="store_true",
+        help="Export cluster model with embedding head")
     args = parser.parse_args()
-    Export(args.checkpoint_path)
+    
+    if args.cluster:
+        ExportCluster(args.checkpoint_path)
+    else:
+        Export(args.checkpoint_path)

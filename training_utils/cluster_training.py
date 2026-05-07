@@ -79,41 +79,37 @@ class ClusterYOLODataset(YOLODataset):
 
     def get_labels(self):
         labels = super().get_labels()
-        nkpt, ndim = self.data.get("kpt_shape", (0, 0))
-        num_attributes = len(self.data.get("attribute_names", []))
-        num_cols = 1 + num_attributes + 4 + nkpt * ndim  # columns without cluster
-        num_cols_no_kpts = 1 + num_attributes + 4  # columns without kpt and without cluster
-
-        for i, lf in enumerate(img2label_paths(self.im_files)):
+        for i, label_file in enumerate(img2label_paths(self.im_files)):
             n = len(labels[i]["cls"])
-            if not Path(lf).exists() or n == 0:
-                labels[i]["cluster"] = np.full(n, -1, dtype=np.int64)
+            if not Path(label_file).exists() or n == 0:
+                labels[i]["cluster"] = np.full(0, -1, dtype=np.int64)
                 continue
-            try:
-                lb = np.loadtxt(lf, dtype=np.float32, ndmin=2)
-                if lb.shape[1] == num_cols + 1 or lb.shape[1] == num_cols_no_kpts + 1:
-                    labels[i]["cluster"] = lb[:, -1].astype(np.int64)
-                else:  # non-cluster dataset tile (no cluster column)
-                    labels[i]["cluster"] = np.full(n, -1, dtype=np.int64)
-            except Exception:
-                labels[i]["cluster"] = np.full(n, -1, dtype=np.int64)
+            labels[i]["cluster"] = np.loadtxt(label_file, dtype=np.float32, ndmin=2)[:, -1].astype(np.int64)
         return labels
 
     def update_labels(self, include_class):
+        """Filter cluster arrays to remove boxes whose class is not in include_class.
+        Cluster array is a 1D array of length n_boxes, where each element is the cluster id of the corresponding GT box.
+
+        Args:
+            include_class (list[int], optional): List of classes to include. If None, all classes are included.
+        """
         # Apply box filter mask to cluster
         if include_class is not None:
             include_class_array = np.array(include_class).reshape(1, -1)
             for i, label in enumerate(self.labels):
                 if "cluster" in label:
-                    j = (label["cls"] == include_class_array).any(1)
-                    self.labels[i]["cluster"] = label["cluster"][j]
+                    # Get a boolean mask of boxes to keep only boxes whose class is in include_class
+                    j = (label["cls"] == include_class_array).any(1)  # (n_boxes,)
+                    # Apply the mask to cluster array to keep clusters of the boxes whose class is in include_class
+                    self.labels[i]["cluster"] = label["cluster"][j]  # (n_boxes_filtered,)
         super().update_labels(include_class)
 
     def get_image_and_label(self, index):
         label = super().get_image_and_label(index)
         cluster = self.labels[index].get("cluster")
         if cluster is not None:
-            # Append cluster to cls to get the same filtering during augmentations
+            # Append cluster to apply the same box-removal filtering to cluster during augmentations
             label["cls"] = np.concatenate(
                 [label["cls"], cluster.astype(np.float32).reshape(-1, 1)], axis=1
             )  # becomes [class_id | attr0 ... attr_na | cluster]
@@ -136,7 +132,7 @@ class ClusterYOLODataset(YOLODataset):
 
 
 class ClusterPoseLoss(v8PoseLoss):
-    """v8PoseLoss extended with a prototypical cluster loss."""
+    """v8PoseLoss extended with a cluster loss."""
 
     def __init__(self, model, cached_features):
         super().__init__(model)
@@ -149,7 +145,10 @@ class ClusterPoseLoss(v8PoseLoss):
     def __call__(self, preds, batch):
         total_loss, loss_items = super().__call__(preds, batch)
         cluster_loss_item = torch.zeros(1, device=self.device)
-        if self._model.training and "cluster" in batch and "features" in self.cached_features:
+        # if self._model.training and "cluster" in batch and "features" in self.cached_features:
+        if self._model.training:
+            assert "cluster" in batch, "Cluster labels not found in batch."
+            assert "features" in self.cached_features, "FeatureHook was not registered."
             batch_size = batch["img"].shape[0]
             cluster_loss = self.calculate_cluster_loss(batch)
             cluster_weight = getattr(self.hyp, "cluster", 1.0)
@@ -202,8 +201,6 @@ class ClusterPoseLoss(v8PoseLoss):
         cluster_loss = torch.tensor(0.0, device=self.device)
         n_families = 0
 
-        family_prototypes = {}  # family_id -> prototype, reused for family loss
-
         for family_id in batch["family_idx"].unique():
             fam = family_per_fg == family_id                     # (n_fg,)
             clusters = cluster_per_fg[fam]                       # (n_fg_fam,)
@@ -214,8 +211,6 @@ class ClusterPoseLoss(v8PoseLoss):
                 continue
             clusters = clusters[valid]
             feats = feats[valid]
-
-            family_prototypes[family_id.item()] = feats.mean(0)  # each family gets a prototype (C,)
 
             unique_clusters = clusters.unique()                  # unique cluster ids within this family
             if len(unique_clusters) < 2:
@@ -311,7 +306,7 @@ class ClusterFamilyPoseTrainer(FamilyPoseTrainer):
     def _register_feature_hook(self, model):
         m = unwrap_model(model)
         detect = m.model[-1]
-        # Use the input dimension to the detect head's first conv layer to determine the embedding head's output dimension
+        # Use the smallest FPN channel count across scales as embed_dim
         in_channels = [detect.cv2[i][0].conv.in_channels for i in range(detect.nl)]
         embed_dim = min(in_channels)
 
