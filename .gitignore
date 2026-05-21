@@ -177,3 +177,6 @@ calibration_*.npy
 
 # Trained artifacts
 training_utils/YOLO11/
+images/
+*.jpg
+*.png

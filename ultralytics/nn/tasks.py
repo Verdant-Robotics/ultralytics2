@@ -597,7 +597,7 @@ class PoseModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
         return v8PoseLoss(self)
-    
+
 
 class PoseSegModel(PoseModel):
     def __init__(self, cfg='yolov11n-pose-seg.yaml', ch=3, nc=None, na=None, data_kpt_shape=(None, None), verbose=True):
@@ -607,7 +607,7 @@ class PoseSegModel(PoseModel):
 
     def _get_anchor_and_img_shuffler(self, batch):
         min_stride = int(self.stride.min())
-        img_H, img_W = batch['ori_shape'][0][0], batch['ori_shape'][0][1]        
+        _, _, img_H, img_W = batch['img'].shape     
         anchor_H, anchor_W = img_H // min_stride, img_W // min_stride
         anchor_shuffler = Shuffler(tile_shape=(anchor_H, anchor_W), num_oper=self.args.shuffle_num)
         img_shuffler = anchor_shuffler.scale((min_stride, min_stride))
