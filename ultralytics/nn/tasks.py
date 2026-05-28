@@ -653,7 +653,7 @@ class PoseSegModel(PoseModel):
         for d_i in sorted_indices:
             x1, y1, x2, y2 = gt_bboxes_scaled[d_i, :4]
             b_idx = batch_idx[d_i].long()
-            assert 0 <= x1 < x2 <= anchor_W and 0 <= y1 < y2 <= anchor_H, f"Box {gt_bboxes_xyxy[d_i]} with stride {stride} is out of bounds for image of size {(img_W, img_H)}"
+            assert 0 <= x1 <= x2 <= anchor_W and 0 <= y1 <= y2 <= anchor_H, f"Box {gt_bboxes_xyxy[d_i]} with stride {stride} is out of bounds for image of size {(img_W, img_H)}"
             bboxes_img[b_idx, int(gt_cls[d_i]), y1:y2, x1:x2] = 1
         return bboxes_img
 
