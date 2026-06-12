@@ -36,6 +36,6 @@ class BoxInstTrainer(yolo.detect.DetectionTrainer):
 
     def get_validator(self):
         """Returns an instance of the BoxInstValidator class for validation."""
-        self.loss_names = 'box_loss', 'pose_loss', 'kobj_loss', 'cls_loss', 'dfl_loss', 'attr_loss', 'prj_loss', 'color_loss'
+        self.loss_names = 'box_loss', 'pose_loss', 'kobj_loss', 'cls_loss', 'dfl_loss', 'attr_loss', 'prj_loss', 'pair_loss'
         return yolo.box_inst.BoxInstValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))
     

@@ -122,7 +122,6 @@ class YOLO(Model):
                 'validator': yolo.pose_seg.PoseSegValidator,
                 'predictor': yolo.pose_seg.PoseSegPredictor,
             },
-            
             'box-inst' : {
                 'model': BoxInstModel,
                 'trainer': yolo.box_inst.BoxInstTrainer,

@@ -409,7 +409,7 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, PoseSeg)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, PoseSeg, BoxInst)) else self.forward(x)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
@@ -801,6 +801,9 @@ class BoxInstModel(PoseModel):
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
     def loss(self, batch, preds=None):
+        if not hasattr(self, 'criterion'):
+            self.criterion = self.init_criterion()
+            
         if preds:
             assert self.training is False
             box_kpt_loss = self.calc_box_kpt_loss(preds=preds, batch=batch)
@@ -813,23 +816,27 @@ class BoxInstModel(PoseModel):
         pred_kpts = pred_kpts if pred_kpts is not None else None
         box_kpt_loss = self.calc_box_kpt_loss(preds=(feats, pred_kpts), batch=batch)
         
-        project_term_losses = self.compute_project_term(...)
-        pairwise_losses = self.compute_pairwise_term(...)
+        project_term_losses = self.compute_project_term()
+        pairwise_losses = self.compute_pairwise_term()
         
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
         loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])  # Order should match self.loss_names in pose_seg/train.py
         return loss_sum, loss_items
         
     def compute_project_term(self):
-        # Compute the projection term loss for BoxInst
         pass
     
     def compute_pairwise_term(self):
-        # Compute the pairwise term loss for BoxInst
         pass
 
     def calc_box_kpt_loss(self, preds, batch):
-        return PoseLossBoxInst(preds, batch)
+        return self.criterion['bbox_kpt'](preds, batch)
+    
+    def init_criterion(self):
+        return {
+            'bbox_kpt': PoseLossBoxInst(self),
+        }
+
 
 class ClassificationModel(BaseModel):
     """YOLO classification model.
@@ -1866,12 +1873,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, PoseSeg}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, PoseSeg, BoxInst}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, PoseSeg}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, PoseSeg, BoxInst}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1953,6 +1960,7 @@ def guess_model_task(model):
     def cfg2task(cfg):
         """Guess from YAML dictionary."""
         m = cfg["head"][-1][-2].lower()  # output module name
+        print("m is: ", m)
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
         if "detect" in m:
@@ -1965,8 +1973,8 @@ def guess_model_task(model):
             return "obb"
         if m == "poseseg":
             return "pose-segmentation"
-        else:
-            raise ValueError(f"Unable to guess task from model config with head module '{m}'")
+        if m == "boxinst":
+            return "box-inst"
 
     # Guess from model cfg
     if isinstance(model, dict):
