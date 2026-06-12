@@ -748,6 +748,23 @@ class v8PSLPose(v8PoseSegLoss):
         loss = self.calculate_bbox_kpt_loss(loss=loss, batch=batch, feats=feats, pred_distri=pred_distri, pred_scores=pred_scores, pred_attributes=pred_attributes, pred_kpts=pred_kpts)
         return loss.sum() * batch_size, loss.detach()
 
+    
+class PoseLossBoxInst(v8PoseLoss):
+    def __init__(self, model):
+        super().__init__(model)
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.seg_ch_num = model.model[-1].seg_ch_num
+        self.no = model.model[-1].no
+
+    def __call__(self, preds, batch):
+        loss = torch.zeros(6, device=self.device)  # box, cls, attributes, dfl, kpt_location, kpt_visibility
+        feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
+        all_preds = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2)
+        pred_distri, pred_scores, pred_attributes, _ = all_preds.split((self.reg_max * 4, self.nc, self.na, self.seg_ch_num), 1)  # B, S, A        
+        loss = self.calculate_bbox_kpt_loss(loss=loss, batch=batch, feats=feats, pred_distri=pred_distri, pred_scores=pred_scores, pred_attributes=pred_attributes, pred_kpts=pred_kpts)
+        batch_size = pred_distri.shape[0]
+        return loss.sum() * batch_size, loss.detach()
+
 
 class v8ClassificationLoss:
     """Criterion class for computing training losses for classification."""

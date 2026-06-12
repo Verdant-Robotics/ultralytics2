@@ -517,7 +517,7 @@ class Exporter:
             self.metadata["kpt_shape"] = model.model[-1].kpt_shape
             if hasattr(model, "kpt_names"):
                 self.metadata["kpt_names"] = model.kpt_names
-        if model.task == 'pose-segmentation':
+        if model.task == 'pose-segmentation' or model.task == 'box-inst':
             self.metadata['seg_ch_num'] = model.model[-1].seg_ch_num
 
         LOGGER.info(

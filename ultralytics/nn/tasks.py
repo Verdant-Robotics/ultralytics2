@@ -71,6 +71,7 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     v10Detect,
     PoseSeg,
+    BoxInst,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -82,6 +83,7 @@ from ultralytics.utils.loss import (
     v8PoseLoss,
     v8SegmentationLoss,
     v8PSLPose,
+    PoseLossBoxInst
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -791,6 +793,43 @@ class PoseSegModel(PoseModel):
             'bbox_kpt': v8PSLPose(self),
         }
 
+
+class BoxInstModel(PoseModel):
+    def __init__(self, cfg='yolov11n-box-inst.yaml', ch=3, nc=None, na=None, data_kpt_shape=(None, None), verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, na=na, data_kpt_shape=data_kpt_shape, verbose=verbose)
+        self.seg_ch_num = self.yaml.get('seg_ch_num')
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def loss(self, batch, preds=None):
+        if preds:
+            assert self.training is False
+            box_kpt_loss = self.calc_box_kpt_loss(preds=preds, batch=batch)
+            seg_obj_loss_item = torch.Tensor([0]).to(box_kpt_loss[0].device)  # Object loss can only be computed during training
+            loss_sum = box_kpt_loss[0]
+            loss_items = torch.cat([box_kpt_loss[1], seg_obj_loss_item, seg_obj_loss_item])  # Order should match self.loss_names in pose_seg/train.py -- projection_loss, color_loss
+            return loss_sum, loss_items
+        preds = self.forward(batch['img'])
+        feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
+        pred_kpts = pred_kpts if pred_kpts is not None else None
+        box_kpt_loss = self.calc_box_kpt_loss(preds=(feats, pred_kpts), batch=batch)
+        
+        project_term_losses = self.compute_project_term(...)
+        pairwise_losses = self.compute_pairwise_term(...)
+        
+        loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
+        loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])  # Order should match self.loss_names in pose_seg/train.py
+        return loss_sum, loss_items
+        
+    def compute_project_term(self):
+        # Compute the projection term loss for BoxInst
+        pass
+    
+    def compute_pairwise_term(self):
+        # Compute the pairwise term loss for BoxInst
+        pass
+
+    def calc_box_kpt_loss(self, preds, batch):
+        return PoseLossBoxInst(preds, batch)
 
 class ClassificationModel(BaseModel):
     """YOLO classification model.
@@ -1926,6 +1965,8 @@ def guess_model_task(model):
             return "obb"
         if m == "poseseg":
             return "pose-segmentation"
+        else:
+            raise ValueError(f"Unable to guess task from model config with head module '{m}'")
 
     # Guess from model cfg
     if isinstance(model, dict):

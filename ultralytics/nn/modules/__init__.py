@@ -89,6 +89,7 @@ from .head import (
     YOLOESegment,
     v10Detect,
     PoseSeg,
+    BoxInst,
 )
 from .transformer import (
     AIFI,
@@ -181,4 +182,5 @@ __all__ = (
     "YOLOESegment",
     "v10Detect",
     "PoseSeg",
+    "BoxInst",
 )
