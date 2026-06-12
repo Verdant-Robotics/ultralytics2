@@ -844,7 +844,8 @@ class BoxInstModel(PoseSegModel):
         row_max = foreground.max(dim=3, keepdim=True).values  # B, C, H, 1
         normalizer = torch.minimum(col_max, row_max) * cls_mask  # B, C, H, W (distributes)
         cls_positives = (foreground > (0.95 * normalizer)).float() * cls_mask  # B, C, H, W
-        weights = torch.maximum(cls_positives, 1.0 - cls_mask)  # B, C, H, W; in-box non-positives are ignored
+        cls_positives_inflated = self._inflate(cls_positives) * cls_mask  # B, C, H, W
+        weights = torch.maximum(torch.maximum(cls_positives * 1, cls_positives_inflated * 0.1), 1.0 - cls_mask)  # B, C, H, W
         loss = self.binary_loss(
             pred=mask_logits,
             target=cls_positives,
