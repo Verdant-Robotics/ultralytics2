@@ -484,7 +484,7 @@ class BoxInstDetectBase(Detect):
     def __init__(self, nc=80, na=0, seg_ch_num=1, ch=()):
         """Initializes the YOLO detection layer with specified number of classes and channels."""
         super().__init__(nc, na, ch)
-        self.no = nc + self.reg_max * 4 + seg_ch_num
+        self.no = nc + na + self.reg_max * 4 + seg_ch_num
         self.seg_ch_num = seg_ch_num
         c4 = max(16, ch[0] // 4)
         self.cv_seg = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), nn.Conv2d(c4, seg_ch_num, 1)) for x in ch)
@@ -504,11 +504,11 @@ class BoxInstDetectBase(Detect):
         x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
         if self.export and self.format in ('saved_model', 'pb', 'tflite', 'edgetpu', 'tfjs'):  # avoid TF FlexSplitV ops
             box = x_cat[:, :self.reg_max * 4]
-            cls = x_cat[:, self.reg_max * 4:self.reg_max * 4 + self.nc]
-            seg_offset = self.reg_max * 4 + self.nc
+            cls = x_cat[:, self.reg_max * 4:self.reg_max * 4 + self.nc + self.na]
+            seg_offset = self.reg_max * 4 + self.nc + self.na
             seg_mask = x_cat[:, seg_offset : seg_offset + self.seg_ch_num]
         else:
-            box, cls, seg_mask = x_cat.split((self.reg_max * 4, self.nc, self.seg_ch_num), 1)
+            box, cls, seg_mask = x_cat.split((self.reg_max * 4, self.nc + self.na, self.seg_ch_num), 1)
 
         dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
 
