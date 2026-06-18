@@ -853,19 +853,14 @@ class BoxInstModel(PoseSegModel):
 
     def compute_max_labeling(self, mask_logits, gt_bitmasks):
         batch_size = gt_bitmasks.shape[0]
-        cls_mask = (gt_bitmasks > 0).float()  # B, C, H, W
-        masked_logits = mask_logits.masked_fill(cls_mask == 0, torch.finfo(mask_logits.dtype).min)
-        col_max = masked_logits.amax(dim=2, keepdim=True)
-        row_max = masked_logits.amax(dim=3, keepdim=True)
-        
-        is_col_max = masked_logits == col_max
-        is_row_max = masked_logits == row_max
-        positives = ((is_col_max | is_row_max) & (cls_mask > 0)).float()
-
-        target = positives # 1 for positive pixels in boxes, 0 for ignored pixels in boxes, 0 for pixels outside boxes
-        weights = torch.maximum(positives, 1.0 - cls_mask)  # 1 if inside box, 0 if ignored, 1 if outside box
-        loss = self.bce(mask_logits, target) * weights
-
+        cls_mask = (gt_bitmasks > 0).float()
+        foreground = mask_logits.detach().sigmoid() * cls_mask
+        col_max = foreground.amax(dim=2, keepdim=True)
+        row_max = foreground.amax(dim=3, keepdim=True)
+        normalizer = torch.minimum(col_max, row_max) * cls_mask
+        positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        weights = torch.maximum(positives, 1.0 - cls_mask)  # if max-label =>1, if outside box => 1, else => 0
+        loss = self.bce(mask_logits, cls_mask) * weights
         loss = loss.mean() * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
