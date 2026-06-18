@@ -852,26 +852,21 @@ class BoxInstModel(PoseSegModel):
     #     return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
     def compute_max_labeling(self, mask_logits, gt_bitmasks):
-        """Max-labeling loss (calc_object0_loss without the inflation): in-box pixels reaching their
-        row/column maximum are labeled foreground, everything outside the class's box union is
-        labeled background, and the remaining in-box pixels are ignored.
-
-        mask_logits: B, C, H, W mask logits. gt_bitmasks: B, C, H, W binary box masks."""
         batch_size = gt_bitmasks.shape[0]
-        cls_mask = (gt_bitmasks > 0).float()
-
-        foreground = mask_logits.masked_fill(cls_mask == 0, torch.finfo(mask_logits.dtype).min)
-        pred_x = foreground.amax(dim=2, keepdim=True)
-        pred_y = foreground.amax(dim=3, keepdim=True)
-        tgt_x  = cls_mask.amax(dim=2, keepdim=True)
-        tgt_y  = cls_mask.amax(dim=3, keepdim=True)
-        loss_per_anchor_x = self.bce(pred_x, tgt_x)
-        loss_per_anchor_y = self.bce(pred_y, tgt_y)
-
-        outside = 1.0 - cls_mask 
-        loss_per_anchor_out = self.bce(mask_logits, torch.zeros_like(mask_logits)) * outside
+        cls_mask = (gt_bitmasks > 0).float()  # B, C, H, W
+        masked_logits = mask_logits.masked_fill(cls_mask == 0, torch.finfo(mask_logits.dtype).min)
+        col_max = masked_logits.amax(dim=2, keepdim=True)
+        row_max = masked_logits.amax(dim=3, keepdim=True)
         
-        loss = (loss_per_anchor_x.mean() + loss_per_anchor_y.mean() + loss_per_anchor_out.mean())
+        is_col_max = masked_logits == col_max
+        is_row_max = masked_logits == row_max
+        positives = ((is_col_max | is_row_max) & (cls_mask > 0)).float()
+
+        target = positives # 1 for positive pixels in boxes, 0 for ignored pixels in boxes, 0 for pixels outside boxes
+        weights = torch.maximum(positives, 1.0 - cls_mask)  # 1 if inside box, 0 if ignored, 1 if outside box
+        loss = self.bce(mask_logits, target) * weights
+
+        loss = loss.mean() * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
     def compute_pairwise_term(self, mask_logits, gt_bitmasks, images):

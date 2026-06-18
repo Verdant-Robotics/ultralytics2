@@ -56,7 +56,7 @@ def extract_seg(preds, seg_ch_num, nc):
     x_flat = preds[0]
     Pi_list = preds[1][0]
     seg_offset = 4 + nc
-    seg_obj1 = x_flat[:, seg_offset + seg_ch_num : seg_offset + 2 * seg_ch_num, :]
+    seg_obj1 = x_flat[:, seg_offset : seg_offset + seg_ch_num, :]
     return seg_obj1, Pi_list
 
 def draw_seg(img_bgr, seg_obj1, Pi_list, seg_ch_num, conf_thresh=0.5, seg_classes=None):
@@ -115,7 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--indexes", type=int, nargs="+", required=True,
                         help="Sample positions in the dataloader iteration order to evaluate "
                              "(flat index across batches; sample k = item k%%batch_size of batch k//batch_size)")
-    parser.add_argument("--seg-conf", type=float, default=0.5, help="Segmentation confidence threshold")
+    parser.add_argument("--seg-conf", type=float, default=0.2, help="Segmentation confidence threshold")
     parser.add_argument("--seg-classes", type=int, nargs="+", default=None, metavar="C",
                         help="Seg channel indices to visualize (default: all). E.g. --seg-classes 0 2 5")
     parser.add_argument("--box-conf", type=float, default=0.25, help="Box confidence threshold")
