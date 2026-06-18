@@ -824,38 +824,54 @@ class BoxInstModel(PoseSegModel):
         assert gt_bitmasks.shape[1] == self.seg_ch_num, \
             f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
 
-        project_term_losses = self.compute_project_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
         loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])  # Order should match self.loss_names in box_inst/train.py
         return loss_sum, loss_items
+    
+    # def compute_project_term(self, mask_logits, gt_bitmasks):
+    #     batch_size = mask_scores.shape[0]
+    #     mask_scores = mask_logits.sigmoid()
+    #     valid = gt_bitmasks.flatten(2).amax(dim=2) > 0  # B, C; classes present in each image
+    #     if valid.any():
+    #         mask_scores, gt_bitmasks = mask_scores[valid], gt_bitmasks[valid]  # N, H, W
+    #         mask_losses_y = self.dice_coefficient(
+    #             mask_scores.amax(dim=1, keepdim=True),  # project onto the x-axis
+    #             gt_bitmasks.amax(dim=1, keepdim=True),
+    #         )
+    #         mask_losses_x = self.dice_coefficient(
+    #             mask_scores.amax(dim=2, keepdim=True),  # project onto the y-axis
+    #             gt_bitmasks.amax(dim=2, keepdim=True),
+    #         )
+    #         loss = (mask_losses_x + mask_losses_y).mean()
+    #     else:
+    #         loss = mask_scores.sum() * 0.0  # keep the graph connected when the batch has no boxes
+    #     loss = loss * self.args.seg
+    #     return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
-    def compute_project_term(self, mask_logits, gt_bitmasks):
+    def compute_max_labeling(self, mask_logits, gt_bitmasks):
         """Max-labeling loss (calc_object0_loss without the inflation): in-box pixels reaching their
         row/column maximum are labeled foreground, everything outside the class's box union is
         labeled background, and the remaining in-box pixels are ignored.
 
         mask_logits: B, C, H, W mask logits. gt_bitmasks: B, C, H, W binary box masks."""
         batch_size = gt_bitmasks.shape[0]
-        cls_mask = (gt_bitmasks > 0).float()              # 1 inside the box, 0 outside
+        cls_mask = (gt_bitmasks > 0).float()
+
+        foreground = mask_logits.masked_fill(cls_mask == 0, torch.finfo(mask_logits.dtype).min)
+        pred_x = foreground.amax(dim=2, keepdim=True)
+        pred_y = foreground.amax(dim=3, keepdim=True)
+        tgt_x  = cls_mask.amax(dim=2, keepdim=True)
+        tgt_y  = cls_mask.amax(dim=3, keepdim=True)
+        loss_per_anchor_x = self.bce(pred_x, tgt_x)
+        loss_per_anchor_y = self.bce(pred_y, tgt_y)
+
+        outside = 1.0 - cls_mask 
+        loss_per_anchor_out = self.bce(mask_logits, torch.zeros_like(mask_logits)) * outside
         
-        pred_x = mask_logits.amax(dim=2, keepdim=True)    # B, C, 1, W   project onto x
-        pred_y = mask_logits.amax(dim=3, keepdim=True)    # B, C, H, 1   project onto y
-        tgt_x  = cls_mask.amax(dim=2, keepdim=True)       # B, C, 1, W
-        tgt_y  = cls_mask.amax(dim=3, keepdim=True)       # B, C, H, 1
-
-        loss_x = self.binary_loss(pred=pred_x, target=tgt_x)
-        loss_y = self.binary_loss(pred=pred_y, target=tgt_y)
-
-        # ---- dense suppression of everything outside the box ----
-        outside = 1.0 - cls_mask                          # B, C, H, W
-        loss_out = self.binary_loss(
-            pred=mask_logits,
-            target=torch.zeros_like(mask_logits),
-            weights=outside,
-        )
-        loss = (loss_x + loss_y + loss_out)
+        loss = (loss_per_anchor_x.mean() + loss_per_anchor_y.mean() + loss_per_anchor_out.mean())
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
     def compute_pairwise_term(self, mask_logits, gt_bitmasks, images):
