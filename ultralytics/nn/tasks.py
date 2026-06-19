@@ -879,16 +879,23 @@ class BoxInstModel(PoseSegModel):
         log_bg_prob_unfold = self._unfold_wo_center(log_bg_prob)
 
         # Probability of both endpoints having the same label: p_i * p_j + (1 - p_i) * (1 - p_j),
-        # computed in log space for numerical stability
-        log_same_fg_prob = log_fg_prob[:, :, None] + log_fg_prob_unfold
-        log_same_bg_prob = log_bg_prob[:, :, None] + log_bg_prob_unfold
+        log_same_fg_prob = log_fg_prob[:, :, None] + log_fg_prob_unfold # p_i * p_j
+        log_same_bg_prob = log_bg_prob[:, :, None] + log_bg_prob_unfold # (1 - p_i) * (1 - p_j)
         max_ = torch.max(log_same_fg_prob, log_same_bg_prob)
-        log_same_prob = torch.log(
+        log_same_prob = torch.log(                                      # p_i * p_j + (1 - p_i) * (1 - p_j)
             torch.exp(log_same_fg_prob - max_) + torch.exp(log_same_bg_prob - max_)
-        ) + max_
+        ) + max_ # numerically stable compared to torch.log(torch.exp(log_same_fg_prob) + torch.exp(log_same_bg_prob))
 
         color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W
-        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
+        
+        # log_same_prob torch.Size([64, 2, 8, 96, 96])
+        
+        cls_mask = (gt_bitmasks > 0).float()                 # B, C, H, W   binary box membership
+        nbr_in_box = self._unfold_wo_center(cls_mask)        # B, C, K*K-1, H, W   neighbour membership
+        weights = cls_mask.unsqueeze(2) * nbr_in_box         # both endpoints inside the box  -> target y_e = 1
+
+        
+        # weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
         loss = (-log_same_prob * weights).sum() / weights.sum().clamp(min=1.0)
 
         if self.training:
