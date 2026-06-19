@@ -800,7 +800,7 @@ class BoxInstModel(PoseSegModel):
         self.pairwise_size = 3
         self.pairwise_dilation = 2
         self.pairwise_color_thresh = 0.3
-        self.pairwise_warmup_iters = 500
+        self.pairwise_warmup_iters = 1
         self.register_buffer('_pairwise_iter', torch.zeros([1]))
 
     def loss(self, batch, preds=None):
