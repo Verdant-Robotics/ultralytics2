@@ -824,32 +824,33 @@ class BoxInstModel(PoseSegModel):
         assert gt_bitmasks.shape[1] == self.seg_ch_num, \
             f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
 
-        project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        # project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        project_term_losses = self.compute_project_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
         loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])  # Order should match self.loss_names in box_inst/train.py
         return loss_sum, loss_items
     
-    # def compute_project_term(self, mask_logits, gt_bitmasks):
-    #     batch_size = mask_scores.shape[0]
-    #     mask_scores = mask_logits.sigmoid()
-    #     valid = gt_bitmasks.flatten(2).amax(dim=2) > 0  # B, C; classes present in each image
-    #     if valid.any():
-    #         mask_scores, gt_bitmasks = mask_scores[valid], gt_bitmasks[valid]  # N, H, W
-    #         mask_losses_y = self.dice_coefficient(
-    #             mask_scores.amax(dim=1, keepdim=True),  # project onto the x-axis
-    #             gt_bitmasks.amax(dim=1, keepdim=True),
-    #         )
-    #         mask_losses_x = self.dice_coefficient(
-    #             mask_scores.amax(dim=2, keepdim=True),  # project onto the y-axis
-    #             gt_bitmasks.amax(dim=2, keepdim=True),
-    #         )
-    #         loss = (mask_losses_x + mask_losses_y).mean()
-    #     else:
-    #         loss = mask_scores.sum() * 0.0  # keep the graph connected when the batch has no boxes
-    #     loss = loss * self.args.seg
-    #     return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+    def compute_project_term(self, mask_logits, gt_bitmasks):
+        mask_scores = mask_logits.sigmoid()
+        batch_size = mask_scores.shape[0]
+        valid = gt_bitmasks.flatten(2).amax(dim=2) > 0  # B, C; classes present in each image
+        if valid.any():
+            mask_scores, gt_bitmasks = mask_scores[valid], gt_bitmasks[valid]  # N, H, W
+            mask_losses_y = self.dice_coefficient(
+                mask_scores.amax(dim=1, keepdim=True),  # project onto the x-axis
+                gt_bitmasks.amax(dim=1, keepdim=True),
+            )
+            mask_losses_x = self.dice_coefficient(
+                mask_scores.amax(dim=2, keepdim=True),  # project onto the y-axis
+                gt_bitmasks.amax(dim=2, keepdim=True),
+            )
+            loss = (mask_losses_x + mask_losses_y).mean()
+        else:
+            loss = mask_scores.sum() * 0.0  # keep the graph connected when the batch has no boxes
+        loss = loss * self.args.seg
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
     def compute_max_labeling(self, mask_logits, gt_bitmasks):
         batch_size = gt_bitmasks.shape[0]
