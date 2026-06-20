@@ -800,7 +800,7 @@ class BoxInstModel(PoseSegModel):
         self.pairwise_size = 3
         self.pairwise_dilation = 2
         self.pairwise_color_thresh = 0.3
-        self.pairwise_warmup_iters = 1
+        self.pairwise_warmup_iters = 5000 # dataset 200, bs = 64, 200/64 * 500 = 1562.5 iterations
         self.register_buffer('_pairwise_iter', torch.zeros([1]))
 
     def loss(self, batch, preds=None):
@@ -859,7 +859,12 @@ class BoxInstModel(PoseSegModel):
         row_max = foreground.amax(dim=3, keepdim=True)
         normalizer = torch.minimum(col_max, row_max) * cls_mask
         positives = (foreground > (0.95 * normalizer)).float() * cls_mask
-        weights = torch.maximum(positives, 1.0 - cls_mask)  # if max-label =>1, if outside box => 1, else => 0
+        
+        col_box_height = cls_mask.sum(dim=2, keepdim=True)
+        col_pos_count = positives.sum(dim=2, keepdim=True)
+        pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
+        
+        weights = torch.maximum(pos_weights, 1.0 - cls_mask)
         loss = self.bce(mask_logits, cls_mask) * weights
         loss = loss.mean() * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
@@ -900,7 +905,7 @@ class BoxInstModel(PoseSegModel):
 
         if self.training:
             self._pairwise_iter += 1
-        warmup_factor = min(self._pairwise_iter.item() / float(self.pairwise_warmup_iters), 1.0)
+        warmup_factor = 0.0 if self._pairwise_iter.item() < self.pairwise_warmup_iters else 1.0
         loss = loss * warmup_factor * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
