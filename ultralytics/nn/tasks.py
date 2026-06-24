@@ -824,33 +824,12 @@ class BoxInstModel(PoseSegModel):
         assert gt_bitmasks.shape[1] == self.seg_ch_num, \
             f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
 
-        # project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
-        project_term_losses = self.compute_project_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
         loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])  # Order should match self.loss_names in box_inst/train.py
         return loss_sum, loss_items
-    
-    def compute_project_term(self, mask_logits, gt_bitmasks):
-        mask_scores = mask_logits.sigmoid()
-        batch_size = mask_scores.shape[0]
-        valid = gt_bitmasks.flatten(2).amax(dim=2) > 0  # B, C; classes present in each image
-        if valid.any():
-            mask_scores, gt_bitmasks = mask_scores[valid], gt_bitmasks[valid]  # N, H, W
-            mask_losses_y = self.dice_coefficient(
-                mask_scores.amax(dim=1, keepdim=True),  # project onto the x-axis
-                gt_bitmasks.amax(dim=1, keepdim=True),
-            )
-            mask_losses_x = self.dice_coefficient(
-                mask_scores.amax(dim=2, keepdim=True),  # project onto the y-axis
-                gt_bitmasks.amax(dim=2, keepdim=True),
-            )
-            loss = (mask_losses_x + mask_losses_y).mean()
-        else:
-            loss = mask_scores.sum() * 0.0  # keep the graph connected when the batch has no boxes
-        loss = loss * self.args.seg
-        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
     def compute_max_labeling(self, mask_logits, gt_bitmasks):
         batch_size = gt_bitmasks.shape[0]
@@ -858,12 +837,19 @@ class BoxInstModel(PoseSegModel):
         foreground = mask_logits.detach().sigmoid() * cls_mask
         col_max = foreground.amax(dim=2, keepdim=True)
         row_max = foreground.amax(dim=3, keepdim=True)
-        normalizer = torch.minimum(col_max, row_max) * cls_mask
-        positives = (foreground > (0.95 * normalizer)).float() * cls_mask
         
-        col_box_height = cls_mask.sum(dim=2, keepdim=True)
-        col_pos_count = positives.sum(dim=2, keepdim=True)
-        pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
+        # normalizer = torch.minimum(col_max, row_max) * cls_mask
+        # positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        # col_box_height = cls_mask.sum(dim=2, keepdim=True)
+        # col_pos_count = positives.sum(dim=2, keepdim=True)
+        # pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
+        
+        positives_by_col = (foreground > (0.95 * col_max)).float() * cls_mask
+        positives_by_row = (foreground > (0.95 * row_max)).float() * cls_mask
+        col_height = cls_mask.sum(dim=2, keepdim=True)
+        row_height = cls_mask.sum(dim=3, keepdim=True)
+        pos_weights = torch.maximum(positives_by_col * col_height, positives_by_row * row_height)
+        
         
         weights = torch.maximum(pos_weights, 1.0 - cls_mask)
         loss = self.bce(mask_logits, cls_mask) * weights
@@ -892,22 +878,14 @@ class BoxInstModel(PoseSegModel):
             torch.exp(log_same_fg_prob - max_) + torch.exp(log_same_bg_prob - max_)
         ) + max_ # numerically stable compared to torch.log(torch.exp(log_same_fg_prob) + torch.exp(log_same_bg_prob))
 
-        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W
-        
-        # log_same_prob torch.Size([64, 2, 8, 96, 96])
-        
-        cls_mask = (gt_bitmasks > 0).float()                 # B, C, H, W   binary box membership
-        nbr_in_box = self._unfold_wo_center(cls_mask)        # B, C, K*K-1, H, W   neighbour membership
-        weights = cls_mask.unsqueeze(2) * nbr_in_box         # both endpoints inside the box  -> target y_e = 1
-
-        
-        # weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
+        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W    
+        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
         loss = (-log_same_prob * weights).sum() / weights.sum().clamp(min=1.0)
 
         if self.training:
             self._pairwise_iter += 1
         # warmup_factor = 0.0 if self._pairwise_iter.item() < self.pairwise_warmup_iters else 1.0
-        warmup_factor = 0.0
+        warmup_factor = 1.0
         loss = loss * warmup_factor * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
