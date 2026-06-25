@@ -838,18 +838,17 @@ class BoxInstModel(PoseSegModel):
         col_max = foreground.amax(dim=2, keepdim=True)
         row_max = foreground.amax(dim=3, keepdim=True)
         
-        # normalizer = torch.minimum(col_max, row_max) * cls_mask
-        # positives = (foreground > (0.95 * normalizer)).float() * cls_mask
-        # col_box_height = cls_mask.sum(dim=2, keepdim=True)
-        # col_pos_count = positives.sum(dim=2, keepdim=True)
-        # pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
+        normalizer = torch.minimum(col_max, row_max) * cls_mask
+        positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        col_box_height = cls_mask.sum(dim=2, keepdim=True)
+        col_pos_count = positives.sum(dim=2, keepdim=True)
+        pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
         
-        positives_by_col = (foreground > (0.95 * col_max)).float() * cls_mask
-        positives_by_row = (foreground > (0.95 * row_max)).float() * cls_mask
-        col_height = cls_mask.sum(dim=2, keepdim=True)
-        row_height = cls_mask.sum(dim=3, keepdim=True)
-        pos_weights = torch.maximum(positives_by_col * col_height, positives_by_row * row_height)
-        
+        # positives_by_col = (foreground > (0.95 * col_max)).float() * cls_mask
+        # positives_by_row = (foreground > (0.95 * row_max)).float() * cls_mask
+        # col_height = cls_mask.sum(dim=2, keepdim=True)
+        # row_height = cls_mask.sum(dim=3, keepdim=True)
+        # pos_weights = torch.maximum(positives_by_col * col_height, positives_by_row * row_height)
         
         weights = torch.maximum(pos_weights, 1.0 - cls_mask)
         loss = self.bce(mask_logits, cls_mask) * weights
