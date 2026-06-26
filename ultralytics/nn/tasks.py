@@ -800,14 +800,17 @@ class BoxInstModel(PoseSegModel):
         self.pairwise_size = 3
         self.pairwise_dilation = 2
         self.pairwise_color_thresh = 0.3
-        self.pairwise_warmup_iters = 22000 
+        self.pairwise_warmup_iters = 6250
         self.register_buffer('_pairwise_iter', torch.zeros([1])) 
         '''
-        phenobench dataset: 1407 images, batch size 128, 1407/128 * 4000 ~= 44000 iterations
+        phenobench: 
+        1407 images, batch size 128, 1407/128 * 4000 ~= 44000 iterations
         pairwise_warmup_iters = 22000
-        voc: dataset 200, bs = 64, 200/64 * 500 = 1562.5 iterations
-        '''
         
+        voc:
+        dataset 200, bs = 64, 200/64 * 4000 = 12500 iterations
+        pairwise_warmup_iters = 6250
+        '''
 
     def loss(self, batch, preds=None):
         if not hasattr(self, 'criterion'):
