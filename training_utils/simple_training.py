@@ -23,6 +23,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--patience", type=int, default=50, help="Number of epochs triggering early stopping when no improvement")
     parser.add_argument("-s", "--batch-size", type=int, default=128, help="Batch size for training")
     parser.add_argument("-b", "--disable-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("-n", "--no-aug", action="store_true", help="Disable all data augmentations during training")
 
     args = parser.parse_args()
 
@@ -43,6 +44,25 @@ if __name__ == "__main__":
     if args.disable_wandb:
         os.environ['WANDB_MODE'] = 'disabled'
 
+    if args.no_aug:
+        # Disable every augmentation knob.
+        aug_params = dict(
+            hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
+            degrees=0.0, translate=0.0, scale=0.0, shear=0.0, perspective=0.0,
+            flipud=0.0, fliplr=0.0, bgr=0.0,
+            mosaic=0.0, mixup=0.0, cutmix=0.0, copy_paste=0.0,
+            erasing=0.0,
+        )
+    else:
+        aug_params = dict(
+            flipud=0.5,
+            fliplr=0.5,
+            scale=0.2,
+            mosaic=0.0,  # Please set this to 0.0 TODO: Fix the issue with mosaic and keypoint detection
+        )
+
+    print(f"Augmentations: {'disabled' if args.no_aug else 'enabled'}")
+
     model.train(
         task=training_task,
         data="verdant.yaml",
@@ -50,16 +70,13 @@ if __name__ == "__main__":
         lr0=args.learning_rate,
         lrf=0.01,
         epochs=args.epochs,
-        flipud=0.5,
-        fliplr=0.5,
-        scale=0.2,
-        mosaic=0.0, # Please set this to 0.0 TODO: Fix the issue with mosaic and keypoint detection
         imgsz=768,
         seed=1,
         batch=args.batch_size,
         name=experiment_name,
         device=[0, 1, 2, 3, 4, 5, 6, 7],
         patience=args.patience,
+        **aug_params,
     )
 
     print("Training completed. Exporting the model by converting checkpoints to ONNX format...")
