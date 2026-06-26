@@ -800,7 +800,7 @@ class BoxInstModel(PoseSegModel):
         self.pairwise_size = 3
         self.pairwise_dilation = 2
         self.pairwise_color_thresh = 0.3
-        self.pairwise_warmup_iters = 6250
+        self.pairwise_warmup_iters = 16666
         self.register_buffer('_pairwise_iter', torch.zeros([1])) 
         '''
         phenobench: 
@@ -810,6 +810,10 @@ class BoxInstModel(PoseSegModel):
         voc:
         dataset 200, bs = 64, 200/64 * 4000 = 12500 iterations
         pairwise_warmup_iters = 6250
+        
+        200/64 * 8000 = 25000 iterations
+        25000 * 2/3 = 16666 iterations
+        
         '''
 
     def loss(self, batch, preds=None):
