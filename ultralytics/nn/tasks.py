@@ -800,21 +800,9 @@ class BoxInstModel(PoseSegModel):
         self.pairwise_size = 3
         self.pairwise_dilation = 2
         self.pairwise_color_thresh = 0.3
-        self.pairwise_warmup_iters = 16666
-        self.register_buffer('_pairwise_iter', torch.zeros([1])) 
-        '''
-        phenobench: 
-        1407 images, batch size 128, 1407/128 * 4000 ~= 44000 iterations
-        pairwise_warmup_iters = 22000
-        
-        voc:
-        dataset 200, bs = 64, 200/64 * 4000 = 12500 iterations
-        pairwise_warmup_iters = 6250
-        
-        200/64 * 8000 = 25000 iterations
-        25000 * 2/3 = 16666 iterations
-        
-        '''
+        self.pairwise_warmup_frac = 2 / 3   # fraction of total training iters spent warming up the pairwise loss
+        self.pairwise_warmup_iters = None   # resolved by the trainer once total iters are known
+        self.register_buffer('_pairwise_iter', torch.zeros([1]))
 
     def loss(self, batch, preds=None):
         if not hasattr(self, 'criterion'):
@@ -850,18 +838,12 @@ class BoxInstModel(PoseSegModel):
         foreground = mask_logits.detach().sigmoid() * cls_mask
         col_max = foreground.amax(dim=2, keepdim=True)
         row_max = foreground.amax(dim=3, keepdim=True)
-        
+
         normalizer = torch.minimum(col_max, row_max) * cls_mask
         positives = (foreground > (0.95 * normalizer)).float() * cls_mask
         col_box_height = cls_mask.sum(dim=2, keepdim=True)
         col_pos_count = positives.sum(dim=2, keepdim=True)
         pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
-        
-        # positives_by_col = (foreground > (0.95 * col_max)).float() * cls_mask
-        # positives_by_row = (foreground > (0.95 * row_max)).float() * cls_mask
-        # col_height = cls_mask.sum(dim=2, keepdim=True)
-        # row_height = cls_mask.sum(dim=3, keepdim=True)
-        # pos_weights = torch.maximum(positives_by_col * col_height, positives_by_row * row_height)
         
         weights = torch.maximum(pos_weights, 1.0 - cls_mask)
         loss = self.bce(mask_logits, cls_mask) * weights
@@ -896,7 +878,8 @@ class BoxInstModel(PoseSegModel):
 
         if self.training:
             self._pairwise_iter += 1
-        warmup_factor = min(self._pairwise_iter.item() / self.pairwise_warmup_iters, 1.0)
+        warmup_iters = self.pairwise_warmup_iters or 1
+        warmup_factor = min(self._pairwise_iter.item() / warmup_iters, 1.0)
         loss = loss * warmup_factor * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
