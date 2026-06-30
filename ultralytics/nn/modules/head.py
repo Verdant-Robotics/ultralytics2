@@ -527,7 +527,6 @@ class BoxInstDetectBase(Detect):
 
 class BoxInst(BoxInstDetectBase):
     def __init__(self, nc=80, na: int = 0, kpt_shape=(17, 3), seg_ch_num=1, ch=()):
-        """Initialize YOLO network with default parameters and Convolutional Layers."""
         super().__init__(nc=nc, na=na, ch=ch, seg_ch_num=seg_ch_num)
         self.kpt_shape = kpt_shape
         self.nk = kpt_shape[0] * kpt_shape[1]
@@ -536,24 +535,13 @@ class BoxInst(BoxInstDetectBase):
         self.detect = BoxInstDetectBase.forward
 
     def forward(self, x):
-        '''
-        Perform forward pass through YOLO model and return predictions.
-        During training: Assuming 2 seg ch + 2 nc, self.no = 64 (dfl) + 2 (seg) + 2 (cls) = 68
-            x = [P3, P4, P5]
-            Each Pi is (bs, self.no, h_i, w_i), with h_i and w_i being different for each P. e.g 8x8, 4x4, 2x2 corresponding to resolution(self.stride) [8, 16, 32]
-        After training: 
-            x[0] = (bs, 8=xyxy(bbox),cls0,cls1,seg0,seg1, anchors_len) e.g anchors_len = 8x8 + 4x4 + 2x2 = 84
-            x[1] = [P3, P4, P5]
-        '''
         bs = x[0].shape[0]
         kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)
         x = self.detect(self, x)
         if self.training:
             return x, kpt
-
         pred_kpt = self.kpts_decode(bs, kpt)
         return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
-
 
     def kpts_decode(self, bs, kpts):
         """Decodes keypoints."""

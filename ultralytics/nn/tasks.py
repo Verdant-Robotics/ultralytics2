@@ -813,7 +813,7 @@ class BoxInstModel(PoseSegModel):
             box_kpt_loss = self.calc_box_kpt_loss(preds=preds, batch=batch)
             seg_loss_item = torch.Tensor([0]).to(box_kpt_loss[0].device)  # BoxInst seg losses can only be computed during training
             loss_sum = box_kpt_loss[0]
-            loss_items = torch.cat([box_kpt_loss[1], seg_loss_item, seg_loss_item])  # Order should match self.loss_names in box_inst/train.py -- prj_loss, pair_loss
+            loss_items = torch.cat([box_kpt_loss[1], seg_loss_item, seg_loss_item])  # Order nust match self.loss_names in box_inst/train.py
             return loss_sum, loss_items
 
         preds = self.forward(batch['img'])
@@ -821,7 +821,7 @@ class BoxInstModel(PoseSegModel):
         box_kpt_loss = self.calc_box_kpt_loss(preds=(feats, pred_kpts), batch=batch)
 
         seg_logits = feats[0][:, -self.seg_ch_num:].float()  # B, seg_ch_num, H, W at the finest anchor stride
-        gt_bitmasks = self._rasterize_class_bitmasks(batch)  # B, nc, H, W union of the gt boxes of each class
+        gt_bitmasks = self._rasterize_class_bitmasks(batch)
         assert gt_bitmasks.shape[1] == self.seg_ch_num, \
             f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
 
@@ -829,7 +829,7 @@ class BoxInstModel(PoseSegModel):
         pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
-        loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])  # Order should match self.loss_names in box_inst/train.py
+        loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])
         return loss_sum, loss_items
 
     def compute_max_labeling(self, mask_logits, gt_bitmasks):
@@ -909,17 +909,7 @@ class BoxInstModel(PoseSegModel):
         downsampled = F.avg_pool2d(images.float(), kernel_size=stride, stride=stride, padding=0)
         images_lab = rgb_to_lab(downsampled)
         diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab)  # B, 3, K*K-1, H, W
-        return torch.exp(-torch.norm(diff, dim=1) * 0.5)  # theta = 2 as in the paper
-
-    @staticmethod
-    def dice_coefficient(x, target):
-        """Dice loss as used by BoxInst/CondInst; x and target are (N, ...), reduced per sample."""
-        eps = 1e-5
-        x = x.flatten(1)
-        target = target.flatten(1)
-        intersection = (x * target).sum(dim=1)
-        union = (x ** 2.0).sum(dim=1) + (target ** 2.0).sum(dim=1) + eps
-        return 1.0 - 2.0 * intersection / union
+        return torch.exp(-torch.norm(diff, dim=1) * 0.5)
 
     def calc_box_kpt_loss(self, preds, batch):
         return self.criterion['bbox_kpt'](preds, batch)
@@ -2052,7 +2042,6 @@ def guess_model_task(model):
     def cfg2task(cfg):
         """Guess from YAML dictionary."""
         m = cfg["head"][-1][-2].lower()  # output module name
-        print("m is: ", m)
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
         if "detect" in m:
