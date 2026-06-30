@@ -115,7 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--indexes", type=int, nargs="+", required=True,
                         help="Sample positions in the dataloader iteration order to evaluate "
                              "(flat index across batches; sample k = item k%%batch_size of batch k//batch_size)")
-    parser.add_argument("--seg-conf", type=float, default=0.2, help="Segmentation confidence threshold")
+    parser.add_argument("--seg-conf", type=float, default=0.5, help="Segmentation confidence threshold")
     parser.add_argument("--seg-classes", type=int, nargs="+", default=None, metavar="C",
                         help="Seg channel indices to visualize (default: all). E.g. --seg-classes 0 2 5")
     parser.add_argument("--box-conf", type=float, default=0.25, help="Box confidence threshold")

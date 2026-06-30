@@ -801,7 +801,6 @@ class BoxInstModel(PoseSegModel):
         self.pairwise_dilation = 2
         self.pairwise_color_thresh = 0.3
         self.pairwise_warmup_frac = 2 / 3   # fraction of total training iters spent warming up the pairwise loss
-        self.pairwise_warmup_iters = None   # resolved by the trainer once total iters are known
         self.register_buffer('_pairwise_iter', torch.zeros([1]))
 
     def loss(self, batch, preds=None):
@@ -878,8 +877,7 @@ class BoxInstModel(PoseSegModel):
 
         if self.training:
             self._pairwise_iter += 1
-        warmup_iters = self.pairwise_warmup_iters or 1
-        warmup_factor = min(self._pairwise_iter.item() / warmup_iters, 1.0)
+        warmup_factor = min(self._pairwise_iter.item() / self.pairwise_warmup_iters, 1.0)
         loss = loss * warmup_factor * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 

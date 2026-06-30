@@ -180,4 +180,3 @@ training_utils/YOLO11/
 images/
 *.jpg
 *.png
-.claude/
