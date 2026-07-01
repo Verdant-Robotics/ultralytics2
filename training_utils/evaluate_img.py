@@ -56,7 +56,7 @@ def extract_seg(preds, seg_ch_num, nc):
     x_flat = preds[0]
     Pi_list = preds[1][0]
     seg_offset = 4 + nc
-    seg_obj1 = x_flat[:, seg_offset + seg_ch_num : seg_offset + 2 * seg_ch_num, :]
+    seg_obj1 = x_flat[:, seg_offset : seg_offset + seg_ch_num, :]
     return seg_obj1, Pi_list
 
 def draw_seg(img_bgr, seg_obj1, Pi_list, seg_ch_num, conf_thresh=0.5, seg_classes=None):

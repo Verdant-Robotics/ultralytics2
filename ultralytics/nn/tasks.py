@@ -71,6 +71,7 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     v10Detect,
     PoseSeg,
+    BoxInst,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -82,6 +83,7 @@ from ultralytics.utils.loss import (
     v8PoseLoss,
     v8SegmentationLoss,
     v8PSLPose,
+    PoseLossBoxInst
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -407,7 +409,7 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, PoseSeg)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, PoseSeg, BoxInst)) else self.forward(x)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
@@ -789,6 +791,130 @@ class PoseSegModel(PoseModel):
     def init_criterion(self):
         return {
             'bbox_kpt': v8PSLPose(self),
+        }
+
+
+class BoxInstModel(PoseSegModel):
+    def __init__(self, cfg='yolov11n-box-inst.yaml', ch=3, nc=None, na=None, data_kpt_shape=(None, None), verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, na=na, data_kpt_shape=data_kpt_shape, verbose=verbose)
+        self.pairwise_size = 3
+        self.pairwise_dilation = 2
+        self.pairwise_color_thresh = 0.3
+        self.pairwise_warmup_frac = 2 / 3   # fraction of total training iters spent warming up the pairwise loss
+        self.register_buffer('_pairwise_iter', torch.zeros([1]))
+
+    def loss(self, batch, preds=None):
+        if not hasattr(self, 'criterion'):
+            self.criterion = self.init_criterion()
+
+        if preds:
+            assert self.training is False
+            box_kpt_loss = self.calc_box_kpt_loss(preds=preds, batch=batch)
+            seg_loss_item = torch.Tensor([0]).to(box_kpt_loss[0].device)  # BoxInst seg losses can only be computed during training
+            loss_sum = box_kpt_loss[0]
+            loss_items = torch.cat([box_kpt_loss[1], seg_loss_item, seg_loss_item])  # Order nust match self.loss_names in box_inst/train.py
+            return loss_sum, loss_items
+
+        preds = self.forward(batch['img'])
+        feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
+        box_kpt_loss = self.calc_box_kpt_loss(preds=(feats, pred_kpts), batch=batch)
+
+        seg_logits = feats[0][:, -self.seg_ch_num:].float()  # B, seg_ch_num, H, W at the finest anchor stride
+        gt_bitmasks = self._rasterize_class_bitmasks(batch)
+        assert gt_bitmasks.shape[1] == self.seg_ch_num, \
+            f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
+
+        project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
+
+        loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
+        loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])
+        return loss_sum, loss_items
+
+    def compute_max_labeling(self, mask_logits, gt_bitmasks):
+        batch_size = gt_bitmasks.shape[0]
+        cls_mask = (gt_bitmasks > 0).float()
+        foreground = mask_logits.detach().sigmoid() * cls_mask
+        col_max = foreground.amax(dim=2, keepdim=True)
+        row_max = foreground.amax(dim=3, keepdim=True)
+
+        normalizer = torch.minimum(col_max, row_max) * cls_mask
+        positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        col_box_height = cls_mask.sum(dim=2, keepdim=True)
+        col_pos_count = positives.sum(dim=2, keepdim=True)
+        pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
+        
+        weights = torch.maximum(pos_weights, 1.0 - cls_mask)
+        loss = self.bce(mask_logits, cls_mask) * weights
+        loss = loss.mean() * self.args.seg
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+
+    def compute_pairwise_term(self, mask_logits, gt_bitmasks, images):
+        """Pairwise affinity loss term (Eq. 8 of the paper): neighbouring pixels whose colors are
+        similar are encouraged to receive the same prediction. Only edges whose center pixel lies
+        inside a gt box of the class (E_in) and whose color similarity exceeds the threshold are
+        supervised.
+
+        mask_logits: B, C, H, W mask logits. gt_bitmasks: B, C, H, W binary box masks.
+        images: B, 3, H*stride, W*stride RGB images in [0, 1]."""
+        batch_size = images.shape[0]
+        log_fg_prob = F.logsigmoid(mask_logits)  # B, C, H, W
+        log_bg_prob = F.logsigmoid(-mask_logits)
+        log_fg_prob_unfold = self._unfold_wo_center(log_fg_prob)  # B, C, K*K-1, H, W
+        log_bg_prob_unfold = self._unfold_wo_center(log_bg_prob)
+
+        # Probability of both endpoints having the same label: p_i * p_j + (1 - p_i) * (1 - p_j),
+        log_same_fg_prob = log_fg_prob[:, :, None] + log_fg_prob_unfold # p_i * p_j
+        log_same_bg_prob = log_bg_prob[:, :, None] + log_bg_prob_unfold # (1 - p_i) * (1 - p_j)
+        max_ = torch.max(log_same_fg_prob, log_same_bg_prob)
+        log_same_prob = torch.log(                                      # p_i * p_j + (1 - p_i) * (1 - p_j)
+            torch.exp(log_same_fg_prob - max_) + torch.exp(log_same_bg_prob - max_)
+        ) + max_ # numerically stable compared to torch.log(torch.exp(log_same_fg_prob) + torch.exp(log_same_bg_prob))
+
+        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W    
+        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
+        loss = (-log_same_prob * weights).sum() / weights.sum().clamp(min=1.0)
+
+        if self.training:
+            self._pairwise_iter += 1
+        warmup_factor = min(self._pairwise_iter.item() / self.pairwise_warmup_iters, 1.0)
+        loss = loss * warmup_factor * self.args.seg
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+
+    def _rasterize_class_bitmasks(self, batch):
+        """Rasterizes the gt boxes into per-class binary union masks (B, nc, H, W) at the finest anchor stride."""
+        gt_bboxes_xyxy = xywh2xyxy(batch['bboxes'])
+        return self._rasterize_sorted_boxes(
+            img=batch['img'], gt_bboxes_xyxy=gt_bboxes_xyxy, gt_cls=batch['cls'], batch_idx=batch['batch_idx'],
+            sorted_indices=range(gt_bboxes_xyxy.shape[0]), stride=int(self.stride[0]),
+        )
+
+    def _unfold_wo_center(self, x):
+        """Returns the K*K-1 dilated neighbours of every pixel: (B, C, H, W) -> (B, C, K*K-1, H, W)."""
+        kernel_size, dilation = self.pairwise_size, self.pairwise_dilation
+        padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
+        unfolded_x = F.unfold(x, kernel_size=kernel_size, padding=padding, dilation=dilation)
+        unfolded_x = unfolded_x.reshape(x.size(0), x.size(1), -1, x.size(2), x.size(3))
+        size = kernel_size ** 2
+        return torch.cat((unfolded_x[:, :, :size // 2], unfolded_x[:, :, size // 2 + 1:]), dim=2)  # remove the center pixel
+
+    def _images_color_similarity(self, images):
+        """LAB color similarity of every pixel with its K*K-1 neighbours, computed at the finest
+        anchor stride resolution: (B, 3, H*stride, W*stride) -> (B, K*K-1, H, W)."""
+        from kornia.color import rgb_to_lab  # scoped so kornia is only required for box-inst training
+
+        stride = int(self.stride[0])
+        downsampled = F.avg_pool2d(images.float(), kernel_size=stride, stride=stride, padding=0)
+        images_lab = rgb_to_lab(downsampled)
+        diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab)  # B, 3, K*K-1, H, W
+        return torch.exp(-torch.norm(diff, dim=1) * 0.5)
+
+    def calc_box_kpt_loss(self, preds, batch):
+        return self.criterion['bbox_kpt'](preds, batch)
+
+    def init_criterion(self):
+        return {
+            'bbox_kpt': PoseLossBoxInst(self),
         }
 
 
@@ -1827,12 +1953,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, PoseSeg}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, PoseSeg, BoxInst}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, PoseSeg}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, PoseSeg, BoxInst}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1926,6 +2052,8 @@ def guess_model_task(model):
             return "obb"
         if m == "poseseg":
             return "pose-segmentation"
+        if m == "boxinst":
+            return "box-inst"
 
     # Guess from model cfg
     if isinstance(model, dict):

@@ -647,6 +647,7 @@ class BaseTrainer:
                 "pose",
                 "obb",
                 "pose-segmentation",
+                "box-inst"
             }:
                 data = check_det_dataset(self.args.data)
                 if "yaml_file" in data:
