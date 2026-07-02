@@ -824,42 +824,42 @@ class BoxInstModel(PoseSegModel):
         assert gt_bitmasks.shape[1] == self.seg_ch_num, \
             f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
 
-        # project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
-        project_term_losses = self.compute_batch_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        # project_term_losses = self.compute_batch_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
         loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])
         return loss_sum, loss_items
     
-    def compute_batch_dice_loss(self, mask_logits, gt_bitmasks):
-        batch_size = gt_bitmasks.shape[0]
-        cls_mask = (gt_bitmasks > 0).float()
-        foreground = mask_logits.detach().sigmoid() * cls_mask
-        col_max = foreground.amax(dim=2, keepdim=True)
-        row_max = foreground.amax(dim=3, keepdim=True)
+    # def compute_batch_dice_loss(self, mask_logits, gt_bitmasks):
+    #     batch_size = gt_bitmasks.shape[0]
+    #     cls_mask = (gt_bitmasks > 0).float()
+    #     foreground = mask_logits.detach().sigmoid() * cls_mask
+    #     col_max = foreground.amax(dim=2, keepdim=True)
+    #     row_max = foreground.amax(dim=3, keepdim=True)
 
-        normalizer = torch.minimum(col_max, row_max) * cls_mask
-        positives = (foreground > (0.95 * normalizer)).float() * cls_mask
-        # col_box_height = cls_mask.sum(dim=2, keepdim=True)
-        # col_pos_count = positives.sum(dim=2, keepdim=True)
-        # pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
-        pos_weights = positives
-        weights = torch.maximum(pos_weights, 1.0 - cls_mask)  # >0 only for the selected pixels
-        eps = 1e-5
-        x = mask_logits.sigmoid()
-        dims = (0, 2, 3)  # pool each class over the batch + spatial, keep the class channel
-        intersection = (weights * x * cls_mask).sum(dim=dims)  # (C,)
-        union = (weights * x ** 2).sum(dim=dims) + (weights * cls_mask).sum(dim=dims) + eps
-        dice = 1.0 - (2 * intersection / union)  # (C,) per-class batch dice
+    #     normalizer = torch.minimum(col_max, row_max) * cls_mask
+    #     positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+    #     # col_box_height = cls_mask.sum(dim=2, keepdim=True)
+    #     # col_pos_count = positives.sum(dim=2, keepdim=True)
+    #     # pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
+    #     pos_weights = positives
+    #     weights = torch.maximum(pos_weights, 1.0 - cls_mask)  # >0 only for the selected pixels
+    #     eps = 1e-5
+    #     x = mask_logits.sigmoid()
+    #     dims = (0, 2, 3)  # pool each class over the batch + spatial, keep the class channel
+    #     intersection = (weights * x * cls_mask).sum(dim=dims)  # (C,)
+    #     union = (weights * x ** 2).sum(dim=dims) + (weights * cls_mask).sum(dim=dims) + eps
+    #     dice = 1.0 - (2 * intersection / union)  # (C,) per-class batch dice
 
-        present = cls_mask.amax(dim=dims) > 0  # (C,) classes with at least one box in the batch
-        if present.any():
-            loss = dice[present].mean()
-        else:
-            loss = x.sum() * 0.0  # keep the graph connected when the batch has no boxes
-        loss = loss * self.args.seg
-        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+    #     present = cls_mask.amax(dim=dims) > 0  # (C,) classes with at least one box in the batch
+    #     if present.any():
+    #         loss = dice[present].mean()
+    #     else:
+    #         loss = x.sum() * 0.0  # keep the graph connected when the batch has no boxes
+    #     loss = loss * self.args.seg
+    #     return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
 
     def compute_max_labeling(self, mask_logits, gt_bitmasks):
