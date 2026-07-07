@@ -480,20 +480,50 @@ class PoseSeg(DetectAndSeg):
             return y
 
 
+class BoxInstMaskBranch(nn.Module):
+    """CondInst-style mask branch for BoxInst semantic segmentation.
+
+    Instead of predicting the seg logits from a single FPN level with a shallow 2-conv head, this
+    refines every FPN level (P3/P4/P5) to a common width, fuses them onto the finest (P3) grid by
+    bilinear upsampling + summation, runs a deeper conv tower for context, and emits `seg_ch_num`
+    logits at the P3 stride. This mirrors AdelaiDet's MaskBranch and gives the weak-supervision
+    losses multi-scale context and more capacity to fill in foreground.
+    """
+
+    def __init__(self, ch, seg_ch_num, c_mid=None, num_convs=4):
+        super().__init__()
+        c_mid = c_mid or max(32, ch[0] // 4)
+        self.refine = nn.ModuleList(Conv(c, c_mid, 3) for c in ch)  # per-level -> common width
+        self.tower = nn.Sequential(*(Conv(c_mid, c_mid, 3) for _ in range(num_convs)))
+        self.head = nn.Conv2d(c_mid, seg_ch_num, 1)
+
+    def forward(self, feats):
+        """feats: [P3, P4, P5] (finest -> coarsest). Returns seg logits at the P3 grid."""
+        x = self.refine[0](feats[0])
+        for i in range(1, len(feats)):
+            x_p = F.interpolate(self.refine[i](feats[i]), size=x.shape[-2:], mode="bilinear", align_corners=False)
+            x = x + x_p
+        return self.head(self.tower(x))
+
+
 class BoxInstDetectBase(Detect):
     def __init__(self, nc=80, na=0, seg_ch_num=1, ch=()):
         """Initializes the YOLO detection layer with specified number of classes and channels."""
         super().__init__(nc, na, ch)
         self.no = nc + na + self.reg_max * 4 + seg_ch_num
         self.seg_ch_num = seg_ch_num
-        c4 = max(16, ch[0] // 4)
-        self.cv_seg = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), nn.Conv2d(c4, seg_ch_num, 1)) for x in ch)
+        # Multi-scale mask branch producing the (supervised) P3-resolution seg logits. Coarser levels
+        # get bilinearly-resized copies purely to keep self.no consistent (they stay unsupervised).
+        self.mask_branch = BoxInstMaskBranch(ch, seg_ch_num)
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         shape = x[0].shape  # BCHW
+        seg_p3 = self.mask_branch(x)  # (B, seg_ch_num, H3, W3); computed before x is overwritten below
         for i in range(self.nl):  # per detection scale
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i]), self.cv_seg[i](x[i])), 1)
+            det = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            seg = seg_p3 if i == 0 else F.interpolate(seg_p3, size=x[i].shape[-2:], mode="bilinear", align_corners=False)
+            x[i] = torch.cat((det, seg), 1)
 
         if self.training:
             return x
