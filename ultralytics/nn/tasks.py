@@ -802,6 +802,11 @@ class BoxInstModel(PoseSegModel):
         self.pairwise_color_thresh = 0.3
         self.pairwise_warmup_frac = 2 / 3   # fraction of total training iters spent warming up the pairwise loss
         self.register_buffer('_pairwise_iter', torch.zeros([1]))
+        # Resolution at which the weak-supervision losses (max-labeling + pairwise) are evaluated.
+        # The seg logits come out of P3 at self.stride[0] (=8); we bilinearly upsample them to this
+        # finer stride and rasterize the box bitmasks / LAB color similarity to match, mirroring
+        # CondInst's MASK_OUT_STRIDE=4. Finer color affinity localizes foreground boundaries better.
+        self.seg_out_stride = 4
 
     def loss(self, batch, preds=None):
         if not hasattr(self, 'criterion'):
@@ -819,10 +824,18 @@ class BoxInstModel(PoseSegModel):
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         box_kpt_loss = self.calc_box_kpt_loss(preds=(feats, pred_kpts), batch=batch)
 
-        seg_logits = feats[0][:, -self.seg_ch_num:].float()  # B, seg_ch_num, H, W at the finest anchor stride
-        gt_bitmasks = self._rasterize_class_bitmasks(batch)
+        seg_logits = feats[0][:, -self.seg_ch_num:].float()  # B, seg_ch_num, H, W at the finest anchor stride (self.stride[0])
+        # Upsample the seg logits from the P3 stride to the finer seg_out_stride so the losses are
+        # evaluated on a higher-resolution grid (matching CondInst's stride-4 supervision).
+        mask_feat_stride = int(self.stride[0])
+        assert mask_feat_stride % self.seg_out_stride == 0, \
+            f'seg_out_stride ({self.seg_out_stride}) must divide the P3 stride ({mask_feat_stride})'
+        seg_logits = self._aligned_bilinear(seg_logits, mask_feat_stride // self.seg_out_stride)
+        gt_bitmasks = self._rasterize_class_bitmasks(batch)  # B, nc, H, W at seg_out_stride
         assert gt_bitmasks.shape[1] == self.seg_ch_num, \
             f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
+        assert gt_bitmasks.shape[-2:] == seg_logits.shape[-2:], \
+            f'seg logits {tuple(seg_logits.shape[-2:])} and bitmasks {tuple(gt_bitmasks.shape[-2:])} must align'
 
         project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         # project_term_losses = self.compute_batch_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
@@ -913,12 +926,28 @@ class BoxInstModel(PoseSegModel):
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
     def _rasterize_class_bitmasks(self, batch):
-        """Rasterizes the gt boxes into per-class binary union masks (B, nc, H, W) at the finest anchor stride."""
+        """Rasterizes the gt boxes into per-class binary union masks (B, nc, H, W) at seg_out_stride."""
         gt_bboxes_xyxy = xywh2xyxy(batch['bboxes'])
         return self._rasterize_sorted_boxes(
             img=batch['img'], gt_bboxes_xyxy=gt_bboxes_xyxy, gt_cls=batch['cls'], batch_idx=batch['batch_idx'],
-            sorted_indices=range(gt_bboxes_xyxy.shape[0]), stride=int(self.stride[0]),
+            sorted_indices=range(gt_bboxes_xyxy.shape[0]), stride=self.seg_out_stride,
         )
+
+    def _aligned_bilinear(self, tensor, factor):
+        """Pixel-aligned bilinear upsampling by an integer factor (mirrors adet.utils.comm.aligned_bilinear).
+
+        Unlike a plain F.interpolate, this keeps the upsampled grid aligned to the low-res pixel centers,
+        so a stride-s logit maps cleanly onto the stride-(s/factor) grid used by the bitmasks / color sim."""
+        assert tensor.dim() == 4 and factor >= 1 and int(factor) == factor
+        factor = int(factor)
+        if factor == 1:
+            return tensor
+        h, w = tensor.shape[2:]
+        tensor = F.pad(tensor, pad=(0, 1, 0, 1), mode='replicate')
+        oh, ow = factor * h + 1, factor * w + 1
+        tensor = F.interpolate(tensor, size=(oh, ow), mode='bilinear', align_corners=True)
+        tensor = F.pad(tensor, pad=(factor // 2, 0, factor // 2, 0), mode='replicate')
+        return tensor[:, :, :oh - 1, :ow - 1]
 
     def _unfold_wo_center(self, x):
         """Returns the K*K-1 dilated neighbours of every pixel: (B, C, H, W) -> (B, C, K*K-1, H, W)."""
@@ -930,11 +959,11 @@ class BoxInstModel(PoseSegModel):
         return torch.cat((unfolded_x[:, :, :size // 2], unfolded_x[:, :, size // 2 + 1:]), dim=2)  # remove the center pixel
 
     def _images_color_similarity(self, images):
-        """LAB color similarity of every pixel with its K*K-1 neighbours, computed at the finest
-        anchor stride resolution: (B, 3, H*stride, W*stride) -> (B, K*K-1, H, W)."""
+        """LAB color similarity of every pixel with its K*K-1 neighbours, computed at seg_out_stride
+        resolution: (B, 3, H*stride, W*stride) -> (B, K*K-1, H, W)."""
         from kornia.color import rgb_to_lab  # scoped so kornia is only required for box-inst training
 
-        stride = int(self.stride[0])
+        stride = self.seg_out_stride
         downsampled = F.avg_pool2d(images.float(), kernel_size=stride, stride=stride, padding=0)
         images_lab = rgb_to_lab(downsampled)
         diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab)  # B, 3, K*K-1, H, W
