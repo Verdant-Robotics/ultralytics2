@@ -1568,7 +1568,13 @@ class TorchVision(nn.Module):
     """
 
     def __init__(
-        self, model: str, weights: str = "DEFAULT", unwrap: bool = True, truncate: int = 2, split: bool = False
+        self,
+        model: str,
+        weights: str = "DEFAULT",
+        unwrap: bool = True,
+        truncate: int = 2,
+        split: bool = False,
+        normalize: bool = False,
     ):
         """Load the model and weights from torchvision.
 
@@ -1578,6 +1584,10 @@ class TorchVision(nn.Module):
             unwrap (bool): Whether to unwrap the model.
             truncate (int): Number of layers to truncate.
             split (bool): Whether to split the output.
+            normalize (bool): Apply ImageNet mean/std normalization to the [0, 1] RGB input before the
+                backbone. Torchvision pretrained weights expect this normalization; without it the
+                pretrained features are used off-distribution. Baked into forward so it is applied
+                consistently in training, validation, and ONNX export.
         """
         import torchvision  # scope for faster 'import ultralytics'
 
@@ -1586,6 +1596,12 @@ class TorchVision(nn.Module):
             self.m = torchvision.models.get_model(model, weights=weights)
         else:
             self.m = torchvision.models.__dict__[model](pretrained=bool(weights))
+        self.normalize = normalize
+        if normalize:
+            # Non-persistent: constant values, kept out of state_dict so checkpoints stay compatible,
+            # but still moved with .to(device) and traced as constants into an exported graph.
+            self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
+            self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
         if unwrap:
             layers = list(self.m.children())
             if isinstance(layers[0], nn.Sequential):  # Second-level for some models like EfficientNet, Swin
@@ -1605,6 +1621,8 @@ class TorchVision(nn.Module):
         Returns:
             (torch.Tensor | list[torch.Tensor]): Output tensor or list of tensors.
         """
+        if self.normalize:
+            x = (x - self.mean) / self.std
         if self.split:
             y = [x]
             y.extend(m(y[-1]) for m in self.m)
