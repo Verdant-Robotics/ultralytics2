@@ -82,6 +82,8 @@ if __name__ == "__main__":
                               # decay is kept deliberately since this run is far longer (500 epochs).
         momentum=0.9,         # CondInst SOLVER.MOMENTUM (ultralytics default is 0.937)
         weight_decay=0.0001,  # CondInst SOLVER.WEIGHT_DECAY (ultralytics default is 0.0005)
+        amp=False,            # FrozenBN backbone (freeze_bn) doesn't re-normalize activations, so fp16
+                              # AMP can overflow -> NaN. Train in fp32 (detectron2 runs FrozenBN in fp32).
         epochs=args.epochs,
         imgsz=768,
         seed=1,
