@@ -45,11 +45,16 @@ if __name__ == "__main__":
         os.environ['WANDB_MODE'] = 'disabled'
 
     if args.no_aug:
-        # Disable every augmentation knob.
+        # Match CondInst's augmentation: horizontal flip only. CondInst uses RandomFlip (horizontal,
+        # p=0.5) plus a mild multi-scale resize; it does NOT use vertical flip, color jitter, rotation,
+        # scale/shear jitter, or mosaic/mixup. In particular flipud=0.0 (vertical flip is harmful on
+        # natural images like VOC). NOTE: CondInst's mild multi-scale (short side 640-800) has no clean
+        # ultralytics equivalent -- the multi_scale knob (0.5-1.5x) is far more aggressive -- so we keep
+        # single-scale imgsz=768 rather than introduce a mismatched, stronger augmentation.
         aug_params = dict(
             hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
             degrees=0.0, translate=0.0, scale=0.0, shear=0.0, perspective=0.0,
-            flipud=0.5, fliplr=0.5, bgr=0.0,
+            flipud=0.0, fliplr=0.5, bgr=0.0,
             mosaic=0.0, mixup=0.0, cutmix=0.0, copy_paste=0.0,
             erasing=0.0,
         )
@@ -63,12 +68,20 @@ if __name__ == "__main__":
 
     print(f"Augmentations: {'disabled' if args.no_aug else 'enabled'}")
 
+    # CondInst trains SGD at lr0=0.01 for batch 16. Linear-scale the LR to the configured batch size
+    # so the per-step update magnitude matches (batch 64 -> 0.04). -r sets the batch-16 base LR.
+    lr0 = args.learning_rate * args.batch_size / 16
+    print(f"Linear-scaled lr0: {lr0} (base {args.learning_rate} @ batch 16 -> batch {args.batch_size})")
+
     model.train(
         task=training_task,
         data="verdant.yaml",
         optimizer='SGD',
-        lr0=args.learning_rate,
-        lrf=0.01,
+        lr0=lr0,
+        lrf=0.01,             # CondInst held LR ~constant (step milestones > max_iter); a mild cosine
+                              # decay is kept deliberately since this run is far longer (500 epochs).
+        momentum=0.9,         # CondInst SOLVER.MOMENTUM (ultralytics default is 0.937)
+        weight_decay=0.0001,  # CondInst SOLVER.WEIGHT_DECAY (ultralytics default is 0.0005)
         epochs=args.epochs,
         imgsz=768,
         seed=1,
