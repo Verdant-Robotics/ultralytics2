@@ -800,7 +800,7 @@ class BoxInstModel(PoseSegModel):
         self.pairwise_size = 3
         self.pairwise_dilation = 2
         self.pairwise_color_thresh = 0.3
-        self.pairwise_warmup_frac = 2 / 3   # fraction of total training iters spent warming up the pairwise loss
+        self.pairwise_warmup_frac = 2.0   # warmup_factor ramps linearly to (1/frac) by end of training; 2.0 -> ends at 0.5
         self.register_buffer('_pairwise_iter', torch.zeros([1]))
 
     def loss(self, batch, preds=None):
