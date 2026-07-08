@@ -1567,36 +1567,8 @@ class TorchVision(nn.Module):
         m (nn.Module): The loaded torchvision model, possibly truncated and unwrapped.
     """
 
-    @staticmethod
-    def _freeze_batchnorm(module: nn.Module) -> None:
-        """Recursively replace every nn.BatchNorm2d in `module` with a FrozenBatchNorm2d.
-
-        FrozenBatchNorm2d applies a fixed affine using the pretrained running stats and never
-        updates in train() mode, so the backbone keeps its ImageNet feature distribution
-        throughout training (the detectron2 `NORM=FrozenBN` behavior). This is stronger than
-        setting requires_grad=False, which would still let BN running stats drift."""
-        from torchvision.ops import FrozenBatchNorm2d
-
-        for name, child in module.named_children():
-            if isinstance(child, nn.BatchNorm2d):
-                frozen = FrozenBatchNorm2d(child.num_features, eps=child.eps)
-                frozen.weight.data.copy_(child.weight.data)
-                frozen.bias.data.copy_(child.bias.data)
-                frozen.running_mean.data.copy_(child.running_mean.data)
-                frozen.running_var.data.copy_(child.running_var.data)
-                setattr(module, name, frozen)
-            else:
-                TorchVision._freeze_batchnorm(child)
-
     def __init__(
-        self,
-        model: str,
-        weights: str = "DEFAULT",
-        unwrap: bool = True,
-        truncate: int = 2,
-        split: bool = False,
-        normalize: bool = False,
-        freeze_bn: bool = False,
+        self, model: str, weights: str = "DEFAULT", unwrap: bool = True, truncate: int = 2, split: bool = False
     ):
         """Load the model and weights from torchvision.
 
@@ -1606,14 +1578,6 @@ class TorchVision(nn.Module):
             unwrap (bool): Whether to unwrap the model.
             truncate (int): Number of layers to truncate.
             split (bool): Whether to split the output.
-            normalize (bool): Apply ImageNet mean/std normalization to the [0, 1] RGB input before the
-                backbone. Torchvision pretrained weights expect this normalization; without it the
-                pretrained features are used off-distribution. Baked into forward so it is applied
-                consistently in training, validation, and ONNX export.
-            freeze_bn (bool): Convert the backbone's BatchNorm to FrozenBatchNorm2d so its running
-                stats and affine params stay fixed at their pretrained (ImageNet) values. Mirrors
-                detectron2's `RESNETS.NORM=FrozenBN`, preventing the pretrained features from drifting
-                under small-batch, detection-dominated training. Conv weights remain trainable.
         """
         import torchvision  # scope for faster 'import ultralytics'
 
@@ -1622,14 +1586,6 @@ class TorchVision(nn.Module):
             self.m = torchvision.models.get_model(model, weights=weights)
         else:
             self.m = torchvision.models.__dict__[model](pretrained=bool(weights))
-        if freeze_bn:
-            self._freeze_batchnorm(self.m)
-        self.normalize = normalize
-        if normalize:
-            # Non-persistent: constant values, kept out of state_dict so checkpoints stay compatible,
-            # but still moved with .to(device) and traced as constants into an exported graph.
-            self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
-            self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
         if unwrap:
             layers = list(self.m.children())
             if isinstance(layers[0], nn.Sequential):  # Second-level for some models like EfficientNet, Swin
@@ -1649,8 +1605,6 @@ class TorchVision(nn.Module):
         Returns:
             (torch.Tensor | list[torch.Tensor]): Output tensor or list of tensors.
         """
-        if self.normalize:
-            x = (x - self.mean) / self.std
         if self.split:
             y = [x]
             y.extend(m(y[-1]) for m in self.m)
