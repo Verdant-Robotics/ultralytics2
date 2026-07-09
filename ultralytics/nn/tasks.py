@@ -794,6 +794,17 @@ class PoseSegModel(PoseModel):
         }
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def normalize_imagenet(img):
+    """Normalize a [0, 1] RGB image tensor (B, 3, H, W) with ImageNet mean/std."""
+    mean = torch.tensor(IMAGENET_MEAN, device=img.device, dtype=img.dtype).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=img.device, dtype=img.dtype).view(1, 3, 1, 1)
+    return (img - mean) / std
+
+
 class BoxInstModel(PoseSegModel):
     def __init__(self, cfg='yolov11n-box-inst.yaml', ch=3, nc=None, na=None, data_kpt_shape=(None, None), verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, na=na, data_kpt_shape=data_kpt_shape, verbose=verbose)
@@ -807,6 +818,7 @@ class BoxInstModel(PoseSegModel):
         if not hasattr(self, 'criterion'):
             self.criterion = self.init_criterion()
 
+        color_similarity = self._images_color_similarity(batch['img'])  # B, K*K-1, H, W
         if preds:
             assert self.training is False
             box_kpt_loss = self.calc_box_kpt_loss(preds=preds, batch=batch)
@@ -815,7 +827,7 @@ class BoxInstModel(PoseSegModel):
             loss_items = torch.cat([box_kpt_loss[1], seg_loss_item, seg_loss_item])  # Order nust match self.loss_names in box_inst/train.py
             return loss_sum, loss_items
 
-        preds = self.forward(batch['img'])
+        preds = self.forward(normalize_imagenet(batch['img']))
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         box_kpt_loss = self.calc_box_kpt_loss(preds=(feats, pred_kpts), batch=batch)
 
@@ -826,7 +838,7 @@ class BoxInstModel(PoseSegModel):
 
         project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         # project_term_losses = self.compute_batch_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
-        pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
+        pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'], color_similarity=color_similarity)
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
         loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])
@@ -880,7 +892,7 @@ class BoxInstModel(PoseSegModel):
         loss = loss.mean() * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
-    def compute_pairwise_term(self, mask_logits, gt_bitmasks, images):
+    def compute_pairwise_term(self, mask_logits, gt_bitmasks, images, color_similarity):
         """Pairwise affinity loss term (Eq. 8 of the paper): neighbouring pixels whose colors are
         similar are encouraged to receive the same prediction. Only edges whose center pixel lies
         inside a gt box of the class (E_in) and whose color similarity exceeds the threshold are
@@ -902,7 +914,6 @@ class BoxInstModel(PoseSegModel):
             torch.exp(log_same_fg_prob - max_) + torch.exp(log_same_bg_prob - max_)
         ) + max_ # numerically stable compared to torch.log(torch.exp(log_same_fg_prob) + torch.exp(log_same_bg_prob))
 
-        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W    
         weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
         loss = (-log_same_prob * weights).sum() / weights.sum().clamp(min=1.0)
 
