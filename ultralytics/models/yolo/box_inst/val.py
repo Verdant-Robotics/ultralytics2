@@ -2,7 +2,6 @@
 
 import torch
 from ultralytics.models.yolo.pose import PoseValidator
-from ultralytics.nn.tasks import normalize_imagenet
 
 
 class BoxInstValidator(PoseValidator):
@@ -11,8 +10,3 @@ class BoxInstValidator(PoseValidator):
         """Initialize a 'BoxInstValidator' object with custom parameters and assigned attributes."""
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.args.task = 'box-inst'
-
-    def preprocess(self, batch):
-        batch = super().preprocess(batch)
-        batch['img'] = normalize_imagenet(batch['img'])
-        return batch
