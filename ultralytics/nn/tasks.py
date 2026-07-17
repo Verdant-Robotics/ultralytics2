@@ -824,7 +824,8 @@ class BoxInstModel(PoseSegModel):
         assert gt_bitmasks.shape[1] == self.seg_ch_num, \
             f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
 
-        project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        # project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        project_term_losses = self.compute_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
@@ -846,6 +847,27 @@ class BoxInstModel(PoseSegModel):
         
         weights = torch.maximum(pos_weights, 1.0 - cls_mask)
         loss = self.bce(mask_logits, cls_mask) * weights
+        loss = loss.mean() * self.args.seg
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+
+    def compute_dice_loss(self, mask_logits, gt_bitmasks):
+        batch_size = gt_bitmasks.shape[0]
+        predictions = mask_logits.sigmoid()
+
+        cls_mask = (gt_bitmasks > 0).float()
+        foreground = predictions.detach() * cls_mask
+        col_max = foreground.amax(dim=2, keepdim=True)
+        row_max = foreground.amax(dim=3, keepdim=True)
+
+        normalizer = torch.minimum(col_max, row_max) * cls_mask
+        positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        weights = torch.maximum(positives, 1.0 - cls_mask)
+
+        # Dice loss calculated jointly over the batch
+        epsilon = 1
+        numerator = 2 * (predictions * positives).sum(dim=(0, 2, 3))
+        denominator = (predictions * weights).pow(2).sum(dim=(0, 2, 3)) + positives.sum(dim=(0, 2, 3))
+        loss = 1 - (numerator + epsilon) / (denominator + epsilon)
         loss = loss.mean() * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
