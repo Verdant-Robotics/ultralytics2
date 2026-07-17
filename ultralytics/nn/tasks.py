@@ -824,8 +824,9 @@ class BoxInstModel(PoseSegModel):
         assert gt_bitmasks.shape[1] == self.seg_ch_num, \
             f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
 
-        # project_term_losses = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
-        project_term_losses = self.compute_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        dice_loss = self.compute_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        bce_loss = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        project_term_losses = (dice_loss[0] + bce_loss[0], dice_loss[1] + bce_loss[1])
         pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
