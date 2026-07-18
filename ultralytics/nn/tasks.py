@@ -882,14 +882,15 @@ class BoxInstModel(PoseSegModel):
         mask_logits: B, C, H, W mask logits. gt_bitmasks: B, C, H, W binary box masks.
         images: B, 3, H*stride, W*stride RGB images in [0, 1]."""
         batch_size = images.shape[0]
-        logit_unfold = self._unfold_wo_center(mask_logits)  # B, C, K*K-1, H, W
+        predictions = mask_logits.sigmoid()
+        pred_unfold = self._unfold_wo_center(predictions)  # B, C, K*K-1, H, W
 
-        # Logit difference
-        logit_diff = mask_logits[:, :, None] - logit_unfold
+        # Probability difference
+        pred_diff = predictions[:, :, None] - pred_unfold
 
-        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W    
+        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W
         weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
-        loss = (logit_diff.pow(2) * weights).sum() / weights.sum().clamp(min=1.0)
+        loss = (pred_diff.pow(2) * weights).sum() / weights.sum().clamp(min=1.0)
 
         if self.training:
             self._pairwise_iter += 1
