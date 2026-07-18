@@ -900,7 +900,8 @@ class BoxInstModel(PoseSegModel):
 
         if self.training:
             self._pairwise_iter += 1
-        warmup_factor = min(self._pairwise_iter.item() / self.pairwise_warmup_iters, 1.0)
+        # warmup_factor = min(self._pairwise_iter.item() / self.pairwise_warmup_iters, 1.0)
+        warmup_factor = 1.0  # min(self._pairwise_iter.item() / self.pairwise_warmup_iters, 1.0)
         loss = loss * warmup_factor * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
