@@ -828,7 +828,7 @@ class BoxInstModel(PoseSegModel):
         bce_loss = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         project_term_losses = (dice_loss[0] + bce_loss[0], dice_loss[1] + bce_loss[1])
         # pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
-        pairwise_losses = self.compute_pairwise_L2_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
+        pairwise_losses = self.compute_pairwise_L1_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
         loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])
@@ -873,7 +873,7 @@ class BoxInstModel(PoseSegModel):
         loss = loss.mean() * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
-    def compute_pairwise_L2_term(self, mask_logits, gt_bitmasks, images):
+    def compute_pairwise_L1_term(self, mask_logits, gt_bitmasks, images):
         """Pairwise affinity loss term: neighbouring pixels whose colors are
         similar are encouraged to receive the same probability. Only edges whose center pixel lies
         inside a gt box of the class (E_in) and whose color similarity exceeds the threshold are
@@ -890,7 +890,7 @@ class BoxInstModel(PoseSegModel):
 
         color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W
         weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
-        loss = (pred_diff.pow(2) * weights).sum() / weights.sum().clamp(min=1.0)
+        loss = (pred_diff.abs() * weights).sum() / weights.sum().clamp(min=1.0)
 
         if self.training:
             self._pairwise_iter += 1
