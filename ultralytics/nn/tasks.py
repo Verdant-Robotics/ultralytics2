@@ -843,6 +843,7 @@ class BoxInstModel(PoseSegModel):
 
         normalizer = torch.minimum(col_max, row_max) * cls_mask
         positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask)
         col_box_height = cls_mask.sum(dim=2, keepdim=True)
         col_pos_count = positives.sum(dim=2, keepdim=True)
         pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
@@ -884,8 +885,8 @@ class BoxInstModel(PoseSegModel):
         batch_size = images.shape[0]
         log_fg_prob = F.logsigmoid(mask_logits)  # B, C, H, W
         log_bg_prob = F.logsigmoid(-mask_logits)
-        log_fg_prob_unfold = self._unfold_wo_center(log_fg_prob)  # B, C, K*K-1, H, W
-        log_bg_prob_unfold = self._unfold_wo_center(log_bg_prob)
+        log_fg_prob_unfold = self._unfold_wo_center(log_fg_prob, self.pairwise_dilation)  # B, C, K*K-1, H, W
+        log_bg_prob_unfold = self._unfold_wo_center(log_bg_prob, self.pairwise_dilation)
 
         # Probability of both endpoints having the same label: p_i * p_j + (1 - p_i) * (1 - p_j),
         log_same_fg_prob = log_fg_prob[:, :, None] + log_fg_prob_unfold # p_i * p_j
@@ -915,7 +916,7 @@ class BoxInstModel(PoseSegModel):
         images: B, 3, H*stride, W*stride RGB images in [0, 1]."""
         batch_size = images.shape[0]
         predictions = mask_logits.sigmoid()
-        pred_unfold = self._unfold_wo_center(predictions)  # B, C, K*K-1, H, W
+        pred_unfold = self._unfold_wo_center(predictions, self.pairwise_dilation)  # B, C, K*K-1, H, W
 
         # Probability difference
         pred_diff = predictions[:, :, None] - pred_unfold
@@ -938,9 +939,11 @@ class BoxInstModel(PoseSegModel):
             sorted_indices=range(gt_bboxes_xyxy.shape[0]), stride=int(self.stride[0]),
         )
 
-    def _unfold_wo_center(self, x):
-        """Returns the K*K-1 dilated neighbours of every pixel: (B, C, H, W) -> (B, C, K*K-1, H, W)."""
-        kernel_size, dilation = self.pairwise_size, self.pairwise_dilation
+    def _unfold_wo_center(self, x, dilation):
+        """Returns the K*K-1 dilated neighbours of every pixel: (B, C, H, W) -> (B, C, K*K-1, H, W).
+
+        dilation controls neighbour spacing (2 for the pairwise/color terms, 1 for max labeling)."""
+        kernel_size = self.pairwise_size
         padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
         unfolded_x = F.unfold(x, kernel_size=kernel_size, padding=padding, dilation=dilation)
         unfolded_x = unfolded_x.reshape(x.size(0), x.size(1), -1, x.size(2), x.size(3))
@@ -955,8 +958,43 @@ class BoxInstModel(PoseSegModel):
         stride = int(self.stride[0])
         downsampled = F.avg_pool2d(images.float(), kernel_size=stride, stride=stride, padding=0)
         images_lab = rgb_to_lab(downsampled)
-        diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab)  # B, 3, K*K-1, H, W
+        diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab, self.pairwise_dilation)  # B, 3, K*K-1, H, W
         return torch.exp(-torch.norm(diff, dim=1) * 0.5)
+
+    def _add_best_neighbor_positives(self, positives, foreground, cls_mask):
+        """Expands the positive mask so that each positive pixel's single highest-valued adjacent
+        neighbour is also marked positive. Only neighbours that lie inside the gt box (cls_mask) are
+        eligible, so a positive on the box border never drags in a pixel outside the box.
+
+        positives: B, C, H, W binary mask of currently selected positives.
+        foreground: B, C, H, W detached foreground probabilities used to rank neighbours.
+        cls_mask: B, C, H, W binary mask of the gt box interior (which neighbours are eligible).
+        Returns the deduped union of the original positives and the selected neighbours (B, C, H, W)."""
+        dilation = 1  # max labeling uses immediately-adjacent neighbours, not the dilation-2 pairwise ones
+        neighbor_vals = self._unfold_wo_center(foreground, dilation)  # B, C, K*K-1, H, W
+        neighbor_in_box = self._unfold_wo_center(cls_mask, dilation) > 0  # B, C, K*K-1, H, W
+        neighbor_vals = neighbor_vals.masked_fill(~neighbor_in_box, float('-inf'))  # rank only in-box neighbours
+        best = neighbor_vals.argmax(dim=2)  # B, C, H, W index of highest in-box neighbour in 0..K*K-2
+        sel = F.one_hot(best, num_classes=neighbor_vals.shape[2]).permute(0, 1, 4, 2, 3).to(positives.dtype)
+        # Keep a choice only when the center is positive AND the chosen neighbour is actually in the box
+        # (guards the degenerate case where a positive has no in-box neighbour -> argmax lands on -inf).
+        sel = sel * positives.unsqueeze(2) * neighbor_in_box.to(positives.dtype)
+
+        # Scatter each selected neighbour back to its true spatial location with F.fold (adjoint of
+        # unfold). Re-insert the dropped center row so the layout matches the kernel F.fold expects.
+        kernel_size = self.pairwise_size
+        padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
+        size = kernel_size ** 2
+        b, c, _, h, w = sel.shape
+        sel_full = torch.zeros(b, c, size, h, w, device=sel.device, dtype=sel.dtype)
+        sel_full[:, :, :size // 2] = sel[:, :, :size // 2]
+        sel_full[:, :, size // 2 + 1:] = sel[:, :, size // 2:]
+        folded = F.fold(
+            sel_full.reshape(b, c * size, h * w), output_size=(h, w),
+            kernel_size=kernel_size, padding=padding, dilation=dilation,
+        )  # B, C, H, W; F.fold sums overlapping writes
+        neighbor_positives = (folded > 0).to(positives.dtype)
+        return (positives + neighbor_positives > 0).to(positives.dtype)
 
     def calc_box_kpt_loss(self, preds, batch):
         return self.criterion['bbox_kpt'](preds, batch)
