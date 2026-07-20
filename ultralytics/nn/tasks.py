@@ -864,6 +864,7 @@ class BoxInstModel(PoseSegModel):
 
         normalizer = torch.minimum(col_max, row_max) * cls_mask
         positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask)
         weights = torch.maximum(positives, 1.0 - cls_mask)
 
         # Dice loss calculated jointly over the batch
