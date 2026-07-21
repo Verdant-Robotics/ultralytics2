@@ -876,7 +876,6 @@ class BoxInstModel(PoseSegModel):
         batch_size = images.shape[0]
         predictions = mask_logits.sigmoid()
         pred_unfold = self._unfold_wo_center(predictions, dilation=self.pairwise_dilation, kernel_size=self.pairwise_kernel_size)  # B, C, K*K-1, H, W
-        # Probability difference
         pred_diff = predictions[:, :, None] - pred_unfold
 
         color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W
@@ -896,9 +895,7 @@ class BoxInstModel(PoseSegModel):
         )
 
     def _unfold_wo_center(self, x, dilation, kernel_size):
-        """Returns the K*K-1 dilated neighbours of every pixel: (B, C, H, W) -> (B, C, K*K-1, H, W).
-
-        dilation controls neighbour spacing (2 for the pairwise/color terms, 1 for max labeling)."""
+        """Returns the K*K-1 dilated neighbours of every pixel: (B, C, H, W) -> (B, C, K*K-1, H, W)."""
         padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
         unfolded_x = F.unfold(x, kernel_size=kernel_size, padding=padding, dilation=dilation)
         unfolded_x = unfolded_x.reshape(x.size(0), x.size(1), -1, x.size(2), x.size(3))
@@ -918,12 +915,13 @@ class BoxInstModel(PoseSegModel):
 
     def _add_best_neighbor_positives(self, positives, foreground, cls_mask, class_logits):
         dilation = 1
-        neighbor_vals = self._unfold_wo_center(foreground, dilation=1, kernel_size=3)  # B, C, K*K-1, H, W
-        neighbor_in_box = self._unfold_wo_center(cls_mask, dilation=1, kernel_size=3) > 0  # B, C, K*K-1, H, W
+        kernel_size = 3
+        neighbor_vals = self._unfold_wo_center(foreground, dilation=dilation, kernel_size=kernel_size)  # B, C, K*K-1, H, W
+        neighbor_in_box = self._unfold_wo_center(cls_mask, dilation=dilation, kernel_size=kernel_size) > 0  # B, C, K*K-1, H, W
 
         top_class = class_logits.argmax(dim=1)  # B, H, W
         is_top = F.one_hot(top_class, positives.shape[1]).permute(0, 3, 1, 2).to(foreground.dtype)  # B, C, H, W
-        neighbor_is_top = self._unfold_wo_center(is_top, dilation=1, kernel_size=3) > 0.5  # B, C, K*K-1, H, W
+        neighbor_is_top = self._unfold_wo_center(is_top, dilation=dilation, kernel_size=kernel_size) > 0.5  # B, C, K*K-1, H, W
 
         eligible = neighbor_in_box & neighbor_is_top  # in-box AND dominant class agrees with channel c
         neighbor_vals = neighbor_vals.masked_fill(~eligible, float('-inf'))  # rank only eligible neighbours
@@ -931,7 +929,6 @@ class BoxInstModel(PoseSegModel):
         sel = F.one_hot(best, num_classes=neighbor_vals.shape[2]).permute(0, 1, 4, 2, 3).to(positives.dtype)
         sel = sel * positives.unsqueeze(2) * eligible.to(positives.dtype)
 
-        kernel_size = self.pairwise_size
         padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
         size = kernel_size ** 2
         b, c, _, h, w = sel.shape
