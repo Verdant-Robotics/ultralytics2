@@ -797,11 +797,9 @@ class PoseSegModel(PoseModel):
 class BoxInstModel(PoseSegModel):
     def __init__(self, cfg='yolov11n-box-inst.yaml', ch=3, nc=None, na=None, data_kpt_shape=(None, None), verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, na=na, data_kpt_shape=data_kpt_shape, verbose=verbose)
-        self.pairwise_size = 3
-        self.pairwise_dilation = 2
         self.pairwise_color_thresh = 0.3
-        self.pairwise_warmup_frac = 2 / 3   # fraction of total training iters spent warming up the pairwise loss
-        self.register_buffer('_pairwise_iter', torch.zeros([1]))
+        self.pairwise_dilation = 2
+        self.pairwise_kernel_size = 3
 
     def loss(self, batch, preds=None):
         if not hasattr(self, 'criterion'):
@@ -827,7 +825,7 @@ class BoxInstModel(PoseSegModel):
         dice_loss = self.compute_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         bce_loss = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
         project_term_losses = (dice_loss[0] + bce_loss[0], dice_loss[1] + bce_loss[1])
-        pairwise_losses = self.compute_pairwise_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
+        pairwise_losses = self.compute_pairwise_L1_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
 
         loss_sum = box_kpt_loss[0] + project_term_losses[0] + pairwise_losses[0]
         loss_items = torch.cat([box_kpt_loss[1], project_term_losses[1], pairwise_losses[1]])
@@ -842,6 +840,7 @@ class BoxInstModel(PoseSegModel):
 
         normalizer = torch.minimum(col_max, row_max) * cls_mask
         positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask, mask_logits.detach())
         col_box_height = cls_mask.sum(dim=2, keepdim=True)
         col_pos_count = positives.sum(dim=2, keepdim=True)
         pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
@@ -862,6 +861,7 @@ class BoxInstModel(PoseSegModel):
 
         normalizer = torch.minimum(col_max, row_max) * cls_mask
         positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask, mask_logits.detach())
         weights = torch.maximum(positives, 1.0 - cls_mask)
 
         # Dice loss calculated jointly over the batch
@@ -872,36 +872,18 @@ class BoxInstModel(PoseSegModel):
         loss = loss.mean() * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
-    def compute_pairwise_term(self, mask_logits, gt_bitmasks, images):
-        """Pairwise affinity loss term (Eq. 8 of the paper): neighbouring pixels whose colors are
-        similar are encouraged to receive the same prediction. Only edges whose center pixel lies
-        inside a gt box of the class (E_in) and whose color similarity exceeds the threshold are
-        supervised.
-
-        mask_logits: B, C, H, W mask logits. gt_bitmasks: B, C, H, W binary box masks.
-        images: B, 3, H*stride, W*stride RGB images in [0, 1]."""
+    def compute_pairwise_L1_term(self, mask_logits, gt_bitmasks, images):
         batch_size = images.shape[0]
-        log_fg_prob = F.logsigmoid(mask_logits)  # B, C, H, W
-        log_bg_prob = F.logsigmoid(-mask_logits)
-        log_fg_prob_unfold = self._unfold_wo_center(log_fg_prob)  # B, C, K*K-1, H, W
-        log_bg_prob_unfold = self._unfold_wo_center(log_bg_prob)
+        predictions = mask_logits.sigmoid()
+        pred_unfold = self._unfold_wo_center(predictions, dilation=self.pairwise_dilation, kernel_size=self.pairwise_kernel_size)  # B, C, K*K-1, H, W
+        pred_diff = predictions[:, :, None] - pred_unfold
 
-        # Probability of both endpoints having the same label: p_i * p_j + (1 - p_i) * (1 - p_j),
-        log_same_fg_prob = log_fg_prob[:, :, None] + log_fg_prob_unfold # p_i * p_j
-        log_same_bg_prob = log_bg_prob[:, :, None] + log_bg_prob_unfold # (1 - p_i) * (1 - p_j)
-        max_ = torch.max(log_same_fg_prob, log_same_bg_prob)
-        log_same_prob = torch.log(                                      # p_i * p_j + (1 - p_i) * (1 - p_j)
-            torch.exp(log_same_fg_prob - max_) + torch.exp(log_same_bg_prob - max_)
-        ) + max_ # numerically stable compared to torch.log(torch.exp(log_same_fg_prob) + torch.exp(log_same_bg_prob))
+        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W
+        valid = self._unfold_wo_center(torch.ones_like(mask_logits[:, :1]), dilation=self.pairwise_dilation, kernel_size=self.pairwise_kernel_size)
+        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2) * valid
+        loss = (pred_diff.abs() * weights).sum() / weights.sum().clamp(min=1.0)
 
-        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W    
-        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
-        loss = (-log_same_prob * weights).sum() / weights.sum().clamp(min=1.0)
-
-        if self.training:
-            self._pairwise_iter += 1
-        warmup_factor = min(self._pairwise_iter.item() / self.pairwise_warmup_iters, 1.0)
-        loss = loss * warmup_factor * self.args.seg
+        loss = loss * self.args.seg
         return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
 
     def _rasterize_class_bitmasks(self, batch):
@@ -912,9 +894,8 @@ class BoxInstModel(PoseSegModel):
             sorted_indices=range(gt_bboxes_xyxy.shape[0]), stride=int(self.stride[0]),
         )
 
-    def _unfold_wo_center(self, x):
+    def _unfold_wo_center(self, x, dilation, kernel_size):
         """Returns the K*K-1 dilated neighbours of every pixel: (B, C, H, W) -> (B, C, K*K-1, H, W)."""
-        kernel_size, dilation = self.pairwise_size, self.pairwise_dilation
         padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
         unfolded_x = F.unfold(x, kernel_size=kernel_size, padding=padding, dilation=dilation)
         unfolded_x = unfolded_x.reshape(x.size(0), x.size(1), -1, x.size(2), x.size(3))
@@ -929,8 +910,37 @@ class BoxInstModel(PoseSegModel):
         stride = int(self.stride[0])
         downsampled = F.avg_pool2d(images.float(), kernel_size=stride, stride=stride, padding=0)
         images_lab = rgb_to_lab(downsampled)
-        diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab)  # B, 3, K*K-1, H, W
+        diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab, dilation=self.pairwise_dilation, kernel_size=self.pairwise_kernel_size)  # B, 3, K*K-1, H, W
         return torch.exp(-torch.norm(diff, dim=1) * 0.5)
+
+    def _add_best_neighbor_positives(self, positives, foreground, cls_mask, class_logits):
+        dilation = 1
+        kernel_size = 3
+        neighbor_vals = self._unfold_wo_center(foreground, dilation=dilation, kernel_size=kernel_size)  # B, C, K*K-1, H, W
+        neighbor_in_box = self._unfold_wo_center(cls_mask, dilation=dilation, kernel_size=kernel_size) > 0  # B, C, K*K-1, H, W
+
+        top_class = class_logits.argmax(dim=1)  # B, H, W
+        is_top = F.one_hot(top_class, positives.shape[1]).permute(0, 3, 1, 2).to(foreground.dtype)  # B, C, H, W
+        neighbor_is_top = self._unfold_wo_center(is_top, dilation=dilation, kernel_size=kernel_size) > 0.5  # B, C, K*K-1, H, W
+
+        eligible = neighbor_in_box & neighbor_is_top  # in-box AND dominant class agrees with channel c
+        neighbor_vals = neighbor_vals.masked_fill(~eligible, float('-inf'))  # rank only eligible neighbours
+        best = neighbor_vals.argmax(dim=2)  # B, C, H, W index of highest eligible neighbour in 0..K*K-2
+        sel = F.one_hot(best, num_classes=neighbor_vals.shape[2]).permute(0, 1, 4, 2, 3).to(positives.dtype)
+        sel = sel * positives.unsqueeze(2) * eligible.to(positives.dtype)
+
+        padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
+        size = kernel_size ** 2
+        b, c, _, h, w = sel.shape
+        sel_full = torch.zeros(b, c, size, h, w, device=sel.device, dtype=sel.dtype)
+        sel_full[:, :, :size // 2] = sel[:, :, :size // 2]
+        sel_full[:, :, size // 2 + 1:] = sel[:, :, size // 2:]
+        folded = F.fold(
+            sel_full.reshape(b, c * size, h * w), output_size=(h, w),
+            kernel_size=kernel_size, padding=padding, dilation=dilation,
+        )
+        neighbor_positives = (folded > 0).to(positives.dtype)
+        return (positives + neighbor_positives > 0).to(positives.dtype)
 
     def calc_box_kpt_loss(self, preds, batch):
         return self.criterion['bbox_kpt'](preds, batch)

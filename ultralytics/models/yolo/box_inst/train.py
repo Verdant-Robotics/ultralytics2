@@ -21,17 +21,6 @@ class BoxInstTrainer(yolo.detect.DetectionTrainer):
                            'See https://github.com/ultralytics/ultralytics/issues/4031.')
 
 
-    def _setup_train(self):
-        """Resolve the pairwise warmup fraction to an absolute iteration count once dataloaders are built."""
-        super()._setup_train()
-        total_iters = len(self.train_loader) * self.epochs
-        model = unwrap_model(self.model)
-        model.pairwise_warmup_iters = max(1, round(model.pairwise_warmup_frac * total_iters))
-        LOGGER.info(
-            f"BoxInst pairwise warmup: {model.pairwise_warmup_iters}/{total_iters} iters "
-            f"({model.pairwise_warmup_frac:.0%} of training)"
-        )
-
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Get pose estimation model with specified configuration and weights."""
         model = BoxInstModel(cfg, ch=3, nc=self.data['nc'], na=self.data['na'], data_kpt_shape=self.data['kpt_shape'], verbose=verbose)
