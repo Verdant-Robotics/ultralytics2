@@ -898,7 +898,8 @@ class BoxInstModel(PoseSegModel):
         ) + max_ # numerically stable compared to torch.log(torch.exp(log_same_fg_prob) + torch.exp(log_same_bg_prob))
 
         color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W    
-        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
+        valid = self._unfold_wo_center(torch.ones_like(mask_logits[:, :1]), self.pairwise_dilation)
+        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2) * valid
         loss = (-log_same_prob * weights).sum() / weights.sum().clamp(min=1.0)
 
         if self.training:
@@ -923,7 +924,8 @@ class BoxInstModel(PoseSegModel):
         pred_diff = predictions[:, :, None] - pred_unfold
 
         color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W
-        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2)
+        valid = self._unfold_wo_center(torch.ones_like(mask_logits[:, :1]), self.pairwise_dilation)
+        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2) * valid
         loss = (pred_diff.abs() * weights).sum() / weights.sum().clamp(min=1.0)
 
         if self.training:
