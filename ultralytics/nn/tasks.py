@@ -843,7 +843,7 @@ class BoxInstModel(PoseSegModel):
 
         normalizer = torch.minimum(col_max, row_max) * cls_mask
         positives = (foreground > (0.95 * normalizer)).float() * cls_mask
-        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask)
+        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask, mask_logits.detach())
         col_box_height = cls_mask.sum(dim=2, keepdim=True)
         col_pos_count = positives.sum(dim=2, keepdim=True)
         pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
@@ -864,7 +864,7 @@ class BoxInstModel(PoseSegModel):
 
         normalizer = torch.minimum(col_max, row_max) * cls_mask
         positives = (foreground > (0.95 * normalizer)).float() * cls_mask
-        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask)
+        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask, mask_logits.detach())
         weights = torch.maximum(positives, 1.0 - cls_mask)
 
         # Dice loss calculated jointly over the batch
@@ -962,24 +962,34 @@ class BoxInstModel(PoseSegModel):
         diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab, self.pairwise_dilation)  # B, 3, K*K-1, H, W
         return torch.exp(-torch.norm(diff, dim=1) * 0.5)
 
-    def _add_best_neighbor_positives(self, positives, foreground, cls_mask):
+    def _add_best_neighbor_positives(self, positives, foreground, cls_mask, class_logits):
         """Expands the positive mask so that each positive pixel's single highest-valued adjacent
-        neighbour is also marked positive. Only neighbours that lie inside the gt box (cls_mask) are
-        eligible, so a positive on the box border never drags in a pixel outside the box.
+        neighbour is also marked positive. A neighbour is eligible for class channel c only if it lies
+        inside the gt box (cls_mask) AND the model's dominant class there is c, so a neighbour is never
+        added to a class whose prediction it does not agree with.
 
         positives: B, C, H, W binary mask of currently selected positives.
         foreground: B, C, H, W detached foreground probabilities used to rank neighbours.
         cls_mask: B, C, H, W binary mask of the gt box interior (which neighbours are eligible).
+        class_logits: B, C, H, W raw (unmasked) per-class scores; argmax over C gives each pixel's
+            dominant class (argmax of logits == argmax of sigmoid probabilities).
         Returns the deduped union of the original positives and the selected neighbours (B, C, H, W)."""
         dilation = 1  # max labeling uses immediately-adjacent neighbours, not the dilation-2 pairwise ones
         neighbor_vals = self._unfold_wo_center(foreground, dilation)  # B, C, K*K-1, H, W
         neighbor_in_box = self._unfold_wo_center(cls_mask, dilation) > 0  # B, C, K*K-1, H, W
-        neighbor_vals = neighbor_vals.masked_fill(~neighbor_in_box, float('-inf'))  # rank only in-box neighbours
-        best = neighbor_vals.argmax(dim=2)  # B, C, H, W index of highest in-box neighbour in 0..K*K-2
+
+        # Per-pixel dominant class (winner-take-all across class channels), lifted to the neighbour axis.
+        top_class = class_logits.argmax(dim=1)  # B, H, W
+        is_top = F.one_hot(top_class, positives.shape[1]).permute(0, 3, 1, 2).to(foreground.dtype)  # B, C, H, W
+        neighbor_is_top = self._unfold_wo_center(is_top, dilation) > 0.5  # B, C, K*K-1, H, W
+
+        eligible = neighbor_in_box & neighbor_is_top  # in-box AND dominant class agrees with channel c
+        neighbor_vals = neighbor_vals.masked_fill(~eligible, float('-inf'))  # rank only eligible neighbours
+        best = neighbor_vals.argmax(dim=2)  # B, C, H, W index of highest eligible neighbour in 0..K*K-2
         sel = F.one_hot(best, num_classes=neighbor_vals.shape[2]).permute(0, 1, 4, 2, 3).to(positives.dtype)
-        # Keep a choice only when the center is positive AND the chosen neighbour is actually in the box
-        # (guards the degenerate case where a positive has no in-box neighbour -> argmax lands on -inf).
-        sel = sel * positives.unsqueeze(2) * neighbor_in_box.to(positives.dtype)
+        # Keep a choice only when the center is positive AND the chosen neighbour is eligible
+        # (guards the degenerate case where a positive has no eligible neighbour -> argmax lands on -inf).
+        sel = sel * positives.unsqueeze(2) * eligible.to(positives.dtype)
 
         # Scatter each selected neighbour back to its true spatial location with F.fold (adjoint of
         # unfold). Re-insert the dropped center row so the layout matches the kernel F.fold expects.
