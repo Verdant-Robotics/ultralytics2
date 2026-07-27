@@ -927,7 +927,7 @@ class BoxInstModel(PoseSegModel):
         neighbor_vals = neighbor_vals.masked_fill(~eligible, float('-inf'))  # rank only eligible neighbours
         best = neighbor_vals.argmax(dim=2)  # B, C, H, W index of highest eligible neighbour in 0..K*K-2
         sel = F.one_hot(best, num_classes=neighbor_vals.shape[2]).permute(0, 1, 4, 2, 3).to(positives.dtype)
-        sel = sel * positives.unsqueeze(2) * eligible.to(positives.dtype)
+        sel = sel * positives.unsqueeze(2) * eligible
 
         padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
         size = kernel_size ** 2
