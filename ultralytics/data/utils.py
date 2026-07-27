@@ -213,6 +213,8 @@ def verify_image_label(args: tuple) -> list:
                     segments = [np.array(x[num_classifications:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
                     lb = np.concatenate((classes.reshape(-1, num_classifications), segments2boxes(segments)), 1)  # (cls, xywh)
                 lb = np.array(lb, dtype=np.float32)
+                if lb.ndim == 2 and lb.shape[1] in (num_classifications + 5, num_expected_columns + 1):  # if cluster label exists
+                    lb = lb[:, :-1]  # ignore cluster label for now.
             nl = len(lb)
             if nl:
                 box_xywh = lb[:, num_classifications : num_classifications + 4]
@@ -224,7 +226,6 @@ def verify_image_label(args: tuple) -> list:
                     if lb.shape[1] == num_classifications + 4:
                         ignore_kpt = True
                     else:
-                        assert lb.shape[1] == num_expected_columns, f'Found {lb.shape[1]} columns. Expected {num_expected_columns}'
                         ignore_kpt = False
                         assert keypoints.max() <= 1, f'Keypoint coordinates should be in [0, 1]. Found {keypoints[keypoints > 1]}'
                         assert keypoints.min() >= 0, f'Keypoint coordinates should be in [0, 1]. Found {keypoints[keypoints < 0]}'

@@ -389,7 +389,7 @@ class BaseTrainer:
                 self.scheduler.step()
 
             self._model_train()
-            if RANK != -1:
+            if RANK != -1 and hasattr(self.train_loader.sampler, "set_epoch"):
                 self.train_loader.sampler.set_epoch(epoch)
             pbar = enumerate(self.train_loader)
             # Update dataloader attributes (optional)

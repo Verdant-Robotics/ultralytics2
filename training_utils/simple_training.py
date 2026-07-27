@@ -10,9 +10,10 @@ from training_utils import (
     training_task,
     experiment_name,
 )
+from cluster_training import ClusterFamilyPoseTrainer
 import os
 import argparse
-from export import Export
+from export import Export, ExportCluster
 
 
 if __name__ == "__main__":
@@ -23,6 +24,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--patience", type=int, default=50, help="Number of epochs triggering early stopping when no improvement")
     parser.add_argument("-s", "--batch-size", type=int, default=128, help="Batch size for training")
     parser.add_argument("-b", "--disable-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("-f", "--family", action="store_true", help="Family-balanced batch sampling + cluster loss")
 
     args = parser.parse_args()
 
@@ -43,7 +45,10 @@ if __name__ == "__main__":
     if args.disable_wandb:
         os.environ['WANDB_MODE'] = 'disabled'
 
+    trainer = ClusterFamilyPoseTrainer if args.family else None
+
     model.train(
+        trainer=trainer,
         task=training_task,
         data="verdant.yaml",
         optimizer='SGD',
@@ -64,5 +69,6 @@ if __name__ == "__main__":
 
     print("Training completed. Exporting the model by converting checkpoints to ONNX format...")
     latest_weights_dir = GetLatestWeightsDir()
-    Export(f"{latest_weights_dir}/best.pt")
-    Export(f"{latest_weights_dir}/last.pt")
+    export_fn = ExportCluster if args.family else Export
+    export_fn(f"{latest_weights_dir}/best.pt")
+    export_fn(f"{latest_weights_dir}/last.pt")
