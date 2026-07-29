@@ -15,12 +15,12 @@ from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
-from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
+from .block import ABCHead, DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect", "PoseSeg", "BoxInst"
+__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect", "PoseSeg", "BoxInst", "PosePrompt", "ABCNet"
 
 
 class Detect(nn.Module):
@@ -383,6 +383,91 @@ class Pose(Detect):
             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
+
+
+class PosePrompt(Pose):
+    """Pose head extended with a per-anchor embedding branch and an example-conditioned ("ABC") head.
+
+    Adds:
+      * cv_embed: a per-FPN-level branch producing an E-dim (raw) embedding per anchor. In Python
+        inference it rides in the auxiliary tuple (so Pose val/predict decoding is unchanged); on
+        EXPORT it is appended to the single output tensor as [box|cls|attr|kpt|embed] so the
+        deployed detector emits per-anchor embeddings (sliced for surviving boxes after NMS).
+      * abc_head: an ABCHead that classifies embeddings against example prototypes. During
+        training the prototypes are built from within-batch episodes inside the loss, so this head's
+        forward only emits embeddings and the loss invokes abc_head directly (its parameters
+        live here, so gradients flow). It is NOT run in the main detection graph: the example-
+        conditioned classification is a separate, tiny model (see ABCNet /
+        PosePromptModel.get_abc_net) run on post-NMS embeddings, so the deployed detector stays
+        transformer-free. The same abc_head serves Python "what-if" via
+        PosePromptModel.classify_embeddings.
+    """
+
+    def __init__(self, nc=80, na=0, kpt_shape=(17, 3), embed_dim=128, ch=()):
+        """Initialize the PosePrompt head.
+
+        Args:
+            nc (int): Number of classes.
+            na (int): Number of binary attributes.
+            kpt_shape (tuple): (num_keypoints, num_dims).
+            embed_dim (int): Per-anchor embedding dimension E (should be divisible by the ABC head's
+                number of attention heads, default 4).
+            ch (tuple): Input channels per FPN level.
+        """
+        super().__init__(nc, na, kpt_shape, ch)
+        self.embed_dim = embed_dim
+        c5 = max(ch[0] // 4, embed_dim)
+        self.cv_embed = nn.ModuleList(
+            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, embed_dim, 1)) for x in ch
+        )
+        self.abc_head = ABCHead(embed_dim, num_heads=4)
+
+    def forward(self, x):
+        """Return pose predictions plus per-anchor embeddings.
+
+        Training: returns (feats, kpt, emb) where feats is the raw Detect output list,
+        kpt is (bs, nk, A) and emb is (bs, E, A).
+        Python inference: returns (y, (feats, kpt, emb)) where y is the Pose tensor
+        (box+cls+attr+kpt, no embeddings), keeping val/predict decoding unchanged.
+        Export: returns a single tensor [box|cls|attr|kpt|embed] (embeddings appended, raw).
+        """
+        bs = x[0].shape[0]
+        kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, nk, A)
+        emb = torch.cat(
+            [self.cv_embed[i](x[i]).view(bs, self.embed_dim, -1) for i in range(self.nl)], -1
+        )  # (bs, E, A)
+        det = Detect.forward(self, x)
+        if self.training:
+            return det, kpt, emb
+        pred_kpt = self.kpts_decode(bs, kpt)
+        if self.export:
+            return torch.cat([det, pred_kpt, emb], 1)  # [box|cls|attr|kpt|embed]
+        return torch.cat([det[0], pred_kpt], 1), (det[1], kpt, emb)
+
+
+class ABCNet(nn.Module):
+    """Standalone, exportable example-conditioned ("ABC") classifier.
+
+    Maps (query_embeddings (N, E), protos (K, E)) -> probs (N, K+1) (softmax over the K example
+    classes + NOTA). This is the small second model run on post-NMS embeddings (and for offline
+    "what-if" re-classification): it wraps the trained ABCHead, so it contains the prototype
+    self-attention and can contextualize the prototypes at inference. N (query count) is a dynamic
+    axis; K is fixed at export.
+
+    Runtime subset selection: to drop a class, fill its prototype slot with the head's
+    sentinel (1, 0, ..., 0). The net was trained to treat that value as "absent" (low
+    score, no contamination of the real prototypes) - no mask input and no equality op in the graph.
+    Deployment may additionally ignore the sentinel output columns and renormalize.
+    """
+
+    def __init__(self, abc_head: ABCHead):
+        """Wrap a trained ABCHead."""
+        super().__init__()
+        self.abc_head = abc_head
+
+    def forward(self, query_embeddings: torch.Tensor, protos: torch.Tensor) -> torch.Tensor:
+        """Return softmax probabilities of shape (N, K+1)."""
+        return self.abc_head(query_embeddings, protos).softmax(-1)
 
 
 class DetectAndSeg(Detect):

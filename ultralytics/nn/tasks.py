@@ -72,6 +72,7 @@ from ultralytics.nn.modules import (
     v10Detect,
     PoseSeg,
     BoxInst,
+    PosePrompt,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -599,6 +600,93 @@ class PoseModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
         return v8PoseLoss(self)
+
+
+class PosePromptModel(PoseModel):
+    """Pose model with a per-anchor embedding branch and an example-conditioned few-shot ("ABC") head.
+
+    Training uses within-batch, within-family episodes built inside the loss (PosePromptLoss); the
+    model forward simply emits per-anchor embeddings and the loss invokes the head's abc_head. The
+    same abc_head can be run standalone on cached embeddings for cheap "what-if" queries via
+    classify_embeddings (no image, no backbone).
+    """
+
+    def __init__(self, cfg="yolo11-pose-prompt.yaml", ch=3, nc=None, na=None, data_kpt_shape=(None, None), verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, na=na, data_kpt_shape=data_kpt_shape, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the PosePromptModel."""
+        from ultralytics.utils.loss import PosePromptLoss
+
+        return PosePromptLoss(self)
+
+    def classify_embeddings(self, query_embeddings: torch.Tensor, examples) -> torch.Tensor:
+        """Standalone "what-if" classification: run only the ABC head on cached embeddings.
+
+        Args:
+            query_embeddings (torch.Tensor): (N, E) query embeddings from a prior forward.
+            examples (Sequence[torch.Tensor]): length-K sequence; examples[k] is an (n_k, E)
+                tensor of example embeddings for class k. Each prototype is the mean of its
+                L2-normalized exemplars.
+
+        Returns:
+            (torch.Tensor): (N, K+1) logits - K class logits followed by the NOTA logit.
+        """
+        abc = self.model[-1].abc_head
+        protos = torch.stack([F.normalize(e, dim=-1, p=2).mean(0) for e in examples], dim=0)  # (K, E)
+        return abc(query_embeddings, protos)
+
+    def get_abc_net(self):
+        """Return the standalone ABC classifier module: (query_embeddings, protos) -> probs.
+
+        This is the small second model (see ABCNet) run on post-NMS embeddings and for the
+        offline "what-if" path. It contains the prototype self-attention, so it is exported/run
+        separately from the transformer-free main detector.
+        """
+        from ultralytics.nn.modules.head import ABCNet
+
+        return ABCNet(self.model[-1].abc_head)
+
+    def export_abc_onnx(self, file: str = "abc_net.onnx", num_protos: int = 3, opset: int = 16):
+        """Export the standalone ABC classifier to ONNX.
+
+        The query count N is a dynamic axis (it varies per frame with the number of post-NMS
+        boxes). The prototype count K is FIXED at export time (= num_protos): the transformer's
+        internal reshapes bake the token count. Runtime subset selection needs no dynamic K and no
+        mask: fill any prototype slot with the "empty" sentinel (1, 0, ..., 0) to drop
+        that class - the net was trained to treat that value as "absent" (low score, no contamination).
+        Deployment can also just ignore the sentinel output columns and renormalize. Set num_protos
+        to the max number of classes you may ever use (and match the training abc_num_slots).
+
+        Args:
+            file (str): Output path.
+            num_protos (int): Number of example prototype slots K baked into the graph.
+            opset (int): ONNX opset. Use <=16 if the engine must decompose LayerNorm (e.g. TRT < 8.6).
+
+        Returns:
+            (str): The written file path. Inputs: query_embeddings (N, E), protos (K, E);
+            output: probs (N, K+1). Only N is dynamic.
+        """
+        net = self.get_abc_net().eval()
+        e = self.model[-1].embed_dim
+        dummy = (torch.zeros(2, e), torch.zeros(num_protos, e))
+        # Disable the MultiheadAttention fused fast path (aten::_transformer_encoder_layer_fwd), which
+        # the ONNX exporter cannot trace; the slow path is mathematically identical.
+        torch.backends.mha.set_fastpath_enabled(False)
+        try:
+            torch.onnx.export(
+                net,
+                dummy,
+                file,
+                opset_version=opset,
+                input_names=["query_embeddings", "protos"],
+                output_names=["probs"],
+                dynamic_axes={"query_embeddings": {0: "N"}, "probs": {0: "N"}},
+                dynamo=False,  # legacy TorchScript exporter (handles TransformerEncoderLayer; no onnxscript dep)
+            )
+        finally:
+            torch.backends.mha.set_fastpath_enabled(True)
+        return file
 
 
 class PoseSegModel(PoseModel):
@@ -1862,6 +1950,7 @@ def parse_model(d, ch, verbose=True):
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
     nc, na, seg_ch_num, act, scales = (d.get(x) for x in ("nc", "na", "seg_ch_num", "activation", "scales"))
+    embed_dim = d.get("embed_dim")  # per-anchor embedding dim for the pose-prompt (ABC) head
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
     if scales:
@@ -1986,12 +2075,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, PoseSeg, BoxInst}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, PoseSeg, BoxInst, PosePrompt}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, PoseSeg, BoxInst}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, PoseSeg, BoxInst, PosePrompt}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -2087,6 +2176,8 @@ def guess_model_task(model):
             return "pose-segmentation"
         if m == "boxinst":
             return "box-inst"
+        if m == "poseprompt":
+            return "pose-prompt"
 
     # Guess from model cfg
     if isinstance(model, dict):
