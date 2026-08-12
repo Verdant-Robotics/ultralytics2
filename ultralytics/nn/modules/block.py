@@ -828,11 +828,19 @@ class ABCHead(nn.Module):
     logit. It is shape-agnostic in the leading dims, so it can be called both systematically over an
     anchor grid and standalone on a flat list of cached embeddings (the "what-if" path).
 
-    A tiny self-attention contextualizes the K prototype tokens among themselves
-    (permutation-equivariant, so the discriminative axis can depend on the SET of classes), then each
-    class logit is a scaled cosine similarity between the query and its contextualized prototype. NOTA
-    is a learnable rejection score, NOT a prototype - "none" means "far from ALL examples" (the
-    complement region), not "close to a particular vector".
+    Scoring is a small relation network so the per-class decision boundaries are not limited to
+    cosine cones:
+      1. a self-attention contextualizes the K prototype tokens among themselves (permutation-
+         equivariant, so the discriminative axis can depend on the SET of classes);
+      2. for each (query, class) pair a shared MLP maps the concatenated, normalized (query,
+         prototype) to a relation vector r_k;
+      3. a second self-attention mixes the K relation vectors ACROSS classes (a residual encoder
+         layer, so each r_k keeps its absolute closeness signal while gaining a relative/contrastive
+         component) - this is what lets the head place a sharp boundary between two nearby classes
+         instead of scoring each class in isolation;
+      4. a shared linear readout maps each mixed relation vector to a scalar class logit.
+    NOTA is a single learnable bias competing in the softmax - "none" means "far from ALL examples"
+    (the complement region), so it is not a token in either attention.
 
     Runtime subset selection uses a learned convention rather than any masking: a prototype slot that
     holds the fixed "empty" sentinel (1, 0, ..., 0) (a normalize-safe unit vector) is trained to
@@ -846,17 +854,25 @@ class ABCHead(nn.Module):
 
         Args:
             embed_dim (int): Embedding dimension E of query/prototype vectors.
-            num_heads (int): Attention heads for the prototype self-attention.
+            num_heads (int): Attention heads for the self-attention layers.
         """
         super().__init__()
         self.embed_dim = embed_dim
-        # Permutation-equivariant set function over the prototype tokens (self-attention + FFN).
+        # (1) permutation-equivariant set function over the prototype tokens (self-attention + FFN).
         self.proto_encoder = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2, dropout=0.0, batch_first=True
         )
-        # Cosine-similarity temperature and bias (as in ContrastiveHead).
-        self.logit_scale = nn.Parameter(torch.ones([]) * torch.tensor(1 / 0.07).log())
-        self.bias = nn.Parameter(torch.tensor([0.0]))
+        # (2) per-(query, class) relation MLP on the concatenated normalized (query, prototype).
+        self.relation = nn.Sequential(
+            nn.Linear(2 * embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, embed_dim)
+        )
+        # (3) cross-class mixing of the K relation vectors (residual encoder layer preserves the
+        # absolute closeness in each r_k while adding the relative/contrastive component).
+        self.relation_encoder = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2, dropout=0.0, batch_first=True
+        )
+        # (4) shared linear readout: mixed relation vector -> scalar class logit.
+        self.readout = nn.Linear(embed_dim, 1)
         # NOTA rejection score: a single learnable threshold competing in the softmax.
         self.nota_bias = nn.Parameter(torch.zeros(1))
 
@@ -875,12 +891,18 @@ class ABCHead(nn.Module):
         Returns:
             (torch.Tensor): Logits of shape (..., K+1): K class logits followed by the NOTA logit.
         """
-        protos = self.contextualize(protos)
-        qn = F.normalize(q, dim=-1, p=2)
-        pn = F.normalize(protos, dim=-1, p=2)
-        sims = torch.matmul(qn, pn.transpose(-1, -2)) * self.logit_scale.exp() + self.bias  # (..., K)
-        s_nota = self.nota_bias.expand(*q.shape[:-1], 1)
-        return torch.cat([sims, s_nota], dim=-1)  # (..., K+1)
+        e = self.embed_dim
+        lead = q.shape[:-1]
+        qn = F.normalize(q.reshape(-1, e), dim=-1, p=2)  # (N, E)
+        pn = F.normalize(self.contextualize(protos), dim=-1, p=2)  # (K, E)
+        n, k = qn.shape[0], pn.shape[0]
+        # (2) relation vector per (query, class) from the concatenated normalized (query, prototype).
+        pair = torch.cat([qn[:, None, :].expand(n, k, e), pn[None, :, :].expand(n, k, e)], dim=-1)  # (N, K, 2E)
+        r = self.relation(pair)  # (N, K, E)
+        # (3) mix relations across the K classes, then (4) read out one scalar logit per class.
+        scores = self.readout(self.relation_encoder(r)).squeeze(-1)  # (N, K)
+        logits = torch.cat([scores, self.nota_bias.expand(n, 1)], dim=-1)  # (N, K+1)
+        return logits.reshape(*lead, k + 1)
 
 
 class RepBottleneck(Bottleneck):
