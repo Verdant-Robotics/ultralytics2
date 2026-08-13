@@ -94,9 +94,13 @@ class PosePromptTrainer(yolo.pose.PoseTrainer):
             dataset = self.build_dataset(dataset_path, mode, batch_size)
 
         k = int(getattr(self.args, "family_group_size", 4))
+        # Per-tile set of nonzero cluster ids, aligned with dataset.im_files by index
+        # (im_files is rebuilt from labels order in get_labels, so labels[i] <-> im_files[i]).
+        clusters = [{int(c) for c in lbl.get("cluster", ()) if c != 0} for lbl in dataset.labels]
         sampler = GroupedFamilySampler(
             dataset.im_files,
             batch_size,
+            clusters=clusters,
             k=k,
             seed=self.args.seed,
             rank=rank,

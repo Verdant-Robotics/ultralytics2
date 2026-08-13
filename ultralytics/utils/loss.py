@@ -878,7 +878,11 @@ class PosePromptLoss(v8PoseLoss):
             # Partition the real clusters into n_real non-overlapping classes (each a set of one or more
             # clusters); some clusters stay unassigned so their queries become NOTA. cls_of_cluster[c] is
             # the class of cluster id c (-1 = unassigned; the unknown cluster is never assigned).
-            n_real = int(torch.randint(1, min(n_clusters, k_max) + 1, (1,), device=device))
+            # Draw the class count twice and take the max: this biases toward MORE classes, so when a
+            # family has several clusters they are more often split into separate classes (kept as
+            # distinct examples) rather than merged into one class or dropped to NOTA - which is where
+            # the weed-vs-weed separation signal comes from.
+            n_real = int(torch.randint(1, min(n_clusters, k_max) + 1, (2,), device=device).max())
             order = real.nonzero().flatten()[torch.randperm(n_clusters, device=device)]  # shuffled real ids
             cls_of_cluster = torch.full((uniq.numel(),), -1, dtype=torch.long, device=device)
             cls_of_cluster[order[:n_real]] = torch.arange(n_real, device=device)  # seed one cluster per class
