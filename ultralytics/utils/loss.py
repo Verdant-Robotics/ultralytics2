@@ -727,6 +727,9 @@ class PosePromptLoss(v8PoseLoss):
         # Fixed number of prototype slots per episode; unused slots are padded with the empty sentinel
         # so the net learns its "absent" meaning. Should match export num_protos (deploy max classes).
         self.abc_num_slots = getattr(self.hyp, "abc_num_slots", 3)
+        # Concentration of the per-cluster stick-breaking mixture (see calculate_abc_loss). Smaller =
+        # prototypes built from fewer members regardless of how many are present; a=1 => Beta(1,1)=Uniform.
+        self.abc_stick_alpha = getattr(self.hyp, "abc_stick_alpha", 1.0)
 
     def __call__(self, preds, batch):
         """Compute the total loss (box, pose, kobj, cls, dfl, attr, abc)."""
@@ -864,15 +867,48 @@ class PosePromptLoss(v8PoseLoss):
                 continue
             cluster_is_exhaustive = uniq < 0  # (n_ids,) whether each cluster was exhaustively labelled (< 0)
 
-            # Per-cluster random-mixture prototypes (one per cluster, unknown included): sum each cluster's
-            # members with Exponential(1) weights, L2-normalize (so cluster size does not matter), then
-            # scale by a random weight in [1, 10] - modelling a user giving a few-to-many examples of each
-            # cluster when several clusters share a class.
-            w = torch.empty(cid.shape[0], device=device, dtype=emb.dtype).exponential_(1.0)
-            cproto = torch.zeros(uniq.numel(), emb.shape[1], device=device, dtype=emb.dtype)
-            cproto.index_add_(0, cid, w[:, None] * emb)  # per-cluster Exp-weighted sum
+            # Per-cluster random-mixture prototypes (one per cluster, unknown included): combine each
+            # cluster's members with random weights, L2-normalize (so cluster size does not affect the
+            # direction), then scale by a random weight in [1, 10] - modelling a user giving a few-to-many
+            # examples of each cluster when several clusters share a class.
+            # The mixture weights come from truncated Dirichlet-process stick-breaking with concentration
+            # a = abc_stick_alpha (i.e. Dirichlet(a/n, ..., a/n)). Unlike a flat Dirichlet(1, ..., 1) -
+            # whose weights collapse to the near-uniform 1/n mean as the member count n grows (a noisy
+            # average) - this keeps the mass on O(a) members regardless of n, so a prototype can still
+            # look like a single (or few) example(s) when many are present. b_i ~ Beta(1, a),
+            # pi_i = b_i * prod_{j<i}(1 - b_j), with the last (random) member forced to b = 1 so the
+            # leftover stick mass is assigned to it (a=1 => Beta(1,1) => Uniform).
+            n_uniq = uniq.numel()
+            n_mem = cid.shape[0]
+            counts = torch.bincount(cid, minlength=n_uniq)  # members per cluster
+            max_n = int(counts.max())
+            # Lay members out in a (n_uniq, max_n) grid in random order within each cluster (sort by
+            # cluster id + noise), so the decreasing stick weights land on members at random.
+            sort_idx = torch.argsort(cid.float() + torch.rand(n_mem, device=device))
+            scid = cid[sort_idx]
+            ramp = torch.arange(n_mem, device=device)
+            boundary = torch.cat([torch.ones(1, dtype=torch.bool, device=device), scid[1:] != scid[:-1]])
+            col = ramp - torch.where(boundary, ramp, torch.zeros_like(ramp)).cummax(0).values  # position in cluster
+            cols = torch.arange(max_n, device=device)
+            valid = cols[None, :] < counts[:, None]
+            last = cols[None, :] == (counts[:, None] - 1)
+            # Stick weights in the embedding dtype: far-tail members may underflow to 0 under fp16, which
+            # is harmless (their weight is negligible), and the small clusters that matter for aggregation
+            # (n = 2, 3) never underflow. The prototype is L2-normalized below, so lost tail mass is moot.
+            u = torch.rand(n_uniq, max_n, device=device, dtype=emb.dtype)
+            b = 1.0 - (1.0 - u) ** (1.0 / self.abc_stick_alpha)  # Beta(1, a) via inverse CDF
+            b = torch.where(last, torch.ones_like(b), b)
+            b = torch.where(valid, b, torch.zeros_like(b))  # invalid slots: b=0 => (1-b)=1 => pi=0
+            prev = torch.cat(
+                [torch.ones(n_uniq, 1, device=device, dtype=emb.dtype), torch.cumprod(1.0 - b, dim=1)[:, :-1]],
+                dim=1,
+            )  # prod_{j<i}(1 - b_j)
+            pi = b * prev  # (n_uniq, max_n); each cluster's weights sum to 1
+            emb_grid = torch.zeros(n_uniq, max_n, emb.shape[1], device=device, dtype=emb.dtype)
+            emb_grid[scid, col] = emb[sort_idx]  # differentiable scatter: grad flows back to members
+            cproto = (pi[:, :, None] * emb_grid).sum(dim=1)  # (n_uniq, E) per-cluster weighted mixture
             cproto = F.normalize(cproto, dim=-1) * torch.empty(
-                uniq.numel(), 1, device=device, dtype=emb.dtype
+                n_uniq, 1, device=device, dtype=emb.dtype
             ).uniform_(1.0, 10.0)
 
             # Partition the real clusters into n_real non-overlapping classes (each a set of one or more
