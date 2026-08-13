@@ -625,16 +625,23 @@ class PosePromptModel(PoseModel):
 
         Args:
             query_embeddings (torch.Tensor): (N, E) query embeddings from a prior forward.
-            examples (Sequence[torch.Tensor]): length-K sequence; examples[k] is an (n_k, E)
-                tensor of example embeddings for class k. Each prototype is the mean of its
-                L2-normalized exemplars.
+            examples (Sequence[torch.Tensor]): length-K sequence; examples[k] is an (n_k, E) tensor of
+                raw example embeddings for class k (kept as a set, not averaged; an empty tensor = an
+                absent class). Sets are padded to a common length and marked by a validity mask.
 
         Returns:
             (torch.Tensor): (N, K+1) logits - K class logits followed by the NOTA logit.
         """
         abc = self.model[-1].abc_head
-        protos = torch.stack([F.normalize(e, dim=-1, p=2).mean(0) for e in examples], dim=0)  # (K, E)
-        return abc(query_embeddings, protos)
+        e = self.model[-1].embed_dim
+        k = len(examples)
+        m = max(1, max(len(x) for x in examples))
+        protos = torch.zeros(k, m, e, device=query_embeddings.device, dtype=query_embeddings.dtype)
+        valid = torch.zeros(k, m, dtype=torch.bool, device=query_embeddings.device)
+        for i, x in enumerate(examples):
+            protos[i, : len(x)] = x
+            valid[i, : len(x)] = True
+        return abc(query_embeddings, protos, valid)
 
     def get_abc_net(self):
         """Return the standalone ABC classifier module: (query_embeddings, protos) -> probs.
@@ -647,29 +654,37 @@ class PosePromptModel(PoseModel):
 
         return ABCNet(self.model[-1].abc_head)
 
-    def export_abc_onnx(self, file: str = "abc_net.onnx", num_protos: int = 3, opset: int = 16):
+    def export_abc_onnx(
+        self, file: str = "abc_net.onnx", num_protos: int = 3, num_examples: int = 16, opset: int = 16
+    ):
         """Export the standalone ABC classifier to ONNX.
 
-        The query count N is a dynamic axis (it varies per frame with the number of post-NMS
-        boxes). The prototype count K is FIXED at export time (= num_protos): the transformer's
-        internal reshapes bake the token count. Runtime subset selection needs no dynamic K and no
-        mask: fill any prototype slot with the "empty" sentinel (1, 0, ..., 0) to drop
-        that class - the net was trained to treat that value as "absent" (low score, no contamination).
-        Deployment can also just ignore the sentinel output columns and renormalize. Set num_protos
-        to the max number of classes you may ever use (and match the training abc_num_slots).
+        The query count N is a dynamic axis (it varies per frame with the number of post-NMS boxes).
+        The class count K (= num_protos) and examples-per-class M (= num_examples) are FIXED at export
+        time: the transformer's internal reshapes bake the token counts. Runtime subset selection uses
+        the validity mask: pass only real examples per class and mark the rest invalid; a class whose mask
+        row is all False is absent (logit forced to -inf, i.e. probability 0, and hidden from the cross-class mixer). Deployment can also
+        just ignore absent-class output columns and renormalize. Set num_protos to the max classes and
+        num_examples to the max examples-per-class you may ever supply (matching abc_num_slots /
+        abc_num_examples).
 
         Args:
             file (str): Output path.
-            num_protos (int): Number of example prototype slots K baked into the graph.
+            num_protos (int): Number of class slots K baked into the graph.
+            num_examples (int): Number of example slots M per class baked into the graph.
             opset (int): ONNX opset. Use <=16 if the engine must decompose LayerNorm (e.g. TRT < 8.6).
 
         Returns:
-            (str): The written file path. Inputs: query_embeddings (N, E), protos (K, E);
-            output: probs (N, K+1). Only N is dynamic.
+            (str): The written file path. Inputs: query_embeddings (N, E), protos (K, M, E),
+            valid (K, M) bool; output: probs (N, K+1). Only N is dynamic.
         """
         net = self.get_abc_net().eval()
         e = self.model[-1].embed_dim
-        dummy = (torch.zeros(2, e), torch.zeros(num_protos, e))
+        dummy = (
+            torch.zeros(2, e),
+            torch.zeros(num_protos, num_examples, e),
+            torch.ones(num_protos, num_examples, dtype=torch.bool),
+        )
         # Disable the MultiheadAttention fused fast path (aten::_transformer_encoder_layer_fwd), which
         # the ONNX exporter cannot trace; the slow path is mathematically identical.
         torch.backends.mha.set_fastpath_enabled(False)
@@ -679,7 +694,7 @@ class PosePromptModel(PoseModel):
                 dummy,
                 file,
                 opset_version=opset,
-                input_names=["query_embeddings", "protos"],
+                input_names=["query_embeddings", "protos", "valid"],
                 output_names=["probs"],
                 dynamic_axes={"query_embeddings": {0: "N"}, "probs": {0: "N"}},
                 dynamo=False,  # legacy TorchScript exporter (handles TransformerEncoderLayer; no onnxscript dep)

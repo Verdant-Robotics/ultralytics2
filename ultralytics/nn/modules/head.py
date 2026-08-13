@@ -448,16 +448,16 @@ class PosePrompt(Pose):
 class ABCNet(nn.Module):
     """Standalone, exportable example-conditioned ("ABC") classifier.
 
-    Maps (query_embeddings (N, E), protos (K, E)) -> probs (N, K+1) (softmax over the K example
-    classes + NOTA). This is the small second model run on post-NMS embeddings (and for offline
-    "what-if" re-classification): it wraps the trained ABCHead, so it contains the prototype
-    self-attention and can contextualize the prototypes at inference. N (query count) is a dynamic
-    axis; K is fixed at export.
+    Maps (query_embeddings (N, E), protos (K, M, E), valid (K, M) bool) -> probs (N, K+1) (softmax over
+    the K example classes + NOTA), where each class is a SET of M example embeddings and `valid` marks
+    the real slots. This is the small second model run on post-NMS embeddings (and for offline "what-if"
+    re-classification): it wraps the trained ABCHead, so it contains the query<->set cross-attention and
+    cross-class mixing. N (query count) is a dynamic axis; K and M are fixed at export.
 
-    Runtime subset selection: to drop a class, fill its prototype slot with the head's
-    sentinel (1, 0, ..., 0). The net was trained to treat that value as "absent" (low
-    score, no contamination of the real prototypes) - no mask input and no equality op in the graph.
-    Deployment may additionally ignore the sentinel output columns and renormalize.
+    Runtime subset selection: pass only real examples per class and mark the rest invalid in `valid`;
+    invalid slots are masked out of the attention (contents irrelevant). A class whose mask row is all
+    False is absent (logit forced to -inf, probability 0, and hidden from the cross-class mixer). Deployment may additionally ignore
+    absent-class output columns and renormalize.
     """
 
     def __init__(self, abc_head: ABCHead):
@@ -465,9 +465,9 @@ class ABCNet(nn.Module):
         super().__init__()
         self.abc_head = abc_head
 
-    def forward(self, query_embeddings: torch.Tensor, protos: torch.Tensor) -> torch.Tensor:
+    def forward(self, query_embeddings: torch.Tensor, protos: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """Return softmax probabilities of shape (N, K+1)."""
-        return self.abc_head(query_embeddings, protos).softmax(-1)
+        return self.abc_head(query_embeddings, protos, valid).softmax(-1)
 
 
 class DetectAndSeg(Detect):

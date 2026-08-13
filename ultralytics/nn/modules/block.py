@@ -828,65 +828,67 @@ class ABCHead(nn.Module):
     logit. It is shape-agnostic in the leading dims, so it can be called both systematically over an
     anchor grid and standalone on a flat list of cached embeddings (the "what-if" path).
 
-    Scoring is a small relation network so the per-class decision boundaries are not limited to
-    cosine cones:
-      1. a self-attention contextualizes the K prototype tokens among themselves (permutation-
-         equivariant, so the discriminative axis can depend on the SET of classes);
-      2. for each (query, class) pair a shared MLP maps the concatenated, normalized (query,
-         prototype) to a relation vector r_k;
-      3. a second self-attention mixes the K relation vectors ACROSS classes (a residual encoder
-         layer, so each r_k keeps its absolute closeness signal while gaining a relative/contrastive
-         component) - this is what lets the head place a sharp boundary between two nearby classes
-         instead of scoring each class in isolation;
-      4. a shared linear readout maps each mixed relation vector to a scalar class logit.
-    NOTA is a single learnable bias competing in the softmax - "none" means "far from ALL examples"
-    (the complement region), so it is not a token in either attention.
+    Each class is a SET of example embeddings (not a single averaged prototype), so a class that spans
+    several visually distinct clusters keeps them as distinct examples - a query of one cluster is not
+    washed out by many examples of another. Scoring:
+      1. each query attends (cross-attention) to a class's example set -> a per-(query, class) context
+         vector, followed by a residual + FFN; there is NO between-class mixing at this stage, so each
+         class is matched as a set on its own;
+      2. a self-attention then mixes the K context vectors ACROSS classes (per query, a residual
+         encoder layer) so each class is scored relative to the other classes present, not in isolation;
+      3. a shared linear readout maps each mixed context vector to a scalar class logit.
+    NOTA is a single learnable bias competing in the softmax - "none" means "matches no class set" (the
+    complement region), so it is not a token in the attention. Match quality is left to what the
+    attention learns (no explicit affinity term), so a query can be compatible with several classes
+    without being identical to any single example.
 
-    Runtime subset selection uses a learned convention rather than any masking: a prototype slot that
-    holds the fixed "empty" sentinel (1, 0, ..., 0) (a normalize-safe unit vector) is trained to
-    mean "class absent" - the net learns not to let it disturb the real prototypes and to give it a
-    low score. There is no mask input; deployment simply fills absent slots with the sentinel (and can
-    drop those output columns and renormalize for an exact guarantee).
+    Variable-size sets use an explicit validity mask (valid (K, M), True = a real example): invalid
+    slots are masked out of the attention, so their contents never matter (no sentinel value). A class
+    whose mask row is ALL False is "absent": its logit is forced to -inf (probability exactly 0) and it
+    is masked out of the cross-class mixer as a key, so it is invisible to the other classes - it cannot
+    change their logits and gets no gradient. (Its cross-attention row is left fully unmasked only to
+    avoid an empty-softmax NaN; that context is then discarded.) Deployment passes only its real examples
+    per class plus the mask (absent-class output columns are already zero).
     """
 
     def __init__(self, embed_dim: int, num_heads: int):
         """Initialize the ABC head.
 
         Args:
-            embed_dim (int): Embedding dimension E of query/prototype vectors.
-            num_heads (int): Attention heads for the self-attention layers.
+            embed_dim (int): Embedding dimension E of query/example vectors.
+            num_heads (int): Attention heads for the cross- and cross-class attention layers.
         """
         super().__init__()
         self.embed_dim = embed_dim
-        # (1) permutation-equivariant set function over the prototype tokens (self-attention + FFN).
-        self.proto_encoder = nn.TransformerEncoderLayer(
+        # (1) each query attends to a class's SET of example embeddings (cross-attention), then a
+        # residual + FFN -> a per-(query, class) context vector. No between-class mixing at this stage.
+        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.0, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2), nn.GELU(), nn.Linear(embed_dim * 2, embed_dim)
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        # (2) cross-class mixing of the K context vectors, separately per query (residual encoder layer):
+        # each class is scored relative to the OTHER classes present, not in isolation.
+        self.class_mixer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2, dropout=0.0, batch_first=True
         )
-        # (2) per-(query, class) relation MLP on the concatenated normalized (query, prototype).
-        self.relation = nn.Sequential(
-            nn.Linear(2 * embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, embed_dim)
-        )
-        # (3) cross-class mixing of the K relation vectors (residual encoder layer preserves the
-        # absolute closeness in each r_k while adding the relative/contrastive component).
-        self.relation_encoder = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2, dropout=0.0, batch_first=True
-        )
-        # (4) shared linear readout: mixed relation vector -> scalar class logit.
+        # (3) shared linear readout: mixed context vector -> scalar class logit.
         self.readout = nn.Linear(embed_dim, 1)
         # NOTA rejection score: a single learnable threshold competing in the softmax.
         self.nota_bias = nn.Parameter(torch.zeros(1))
 
-    def contextualize(self, protos: torch.Tensor) -> torch.Tensor:
-        """Contextualize the K prototype tokens among themselves. protos (K, E) -> (K, E)."""
-        return self.proto_encoder(protos.unsqueeze(0)).squeeze(0)
-
-    def forward(self, q: torch.Tensor, protos: torch.Tensor) -> torch.Tensor:
-        """Classify query embeddings against example prototypes.
+    def forward(self, q: torch.Tensor, protos: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """Classify query embeddings against per-class example sets.
 
         Args:
             q (torch.Tensor): Query embeddings, shape (..., E) for any leading dims.
-            protos (torch.Tensor): Example prototypes, shape (K, E). Absent classes are represented by
-                the "empty" sentinel (1, 0, ..., 0) (handled by learning, not masking).
+            protos (torch.Tensor): Per-class example sets, shape (K, M, E): K class slots, each padded to
+                M example embeddings. Invalid (padding) slots are masked out, so their contents are
+                irrelevant.
+            valid (torch.Tensor): Boolean mask (K, M), True where a slot holds a real example. A class
+                whose row is all False is absent: its logit is forced to -inf and it is hidden from the
+                cross-class mixer.
 
         Returns:
             (torch.Tensor): Logits of shape (..., K+1): K class logits followed by the NOTA logit.
@@ -894,13 +896,25 @@ class ABCHead(nn.Module):
         e = self.embed_dim
         lead = q.shape[:-1]
         qn = F.normalize(q.reshape(-1, e), dim=-1, p=2)  # (N, E)
-        pn = F.normalize(self.contextualize(protos), dim=-1, p=2)  # (K, E)
-        n, k = qn.shape[0], pn.shape[0]
-        # (2) relation vector per (query, class) from the concatenated normalized (query, prototype).
-        pair = torch.cat([qn[:, None, :].expand(n, k, e), pn[None, :, :].expand(n, k, e)], dim=-1)  # (N, K, 2E)
-        r = self.relation(pair)  # (N, K, E)
-        # (3) mix relations across the K classes, then (4) read out one scalar logit per class.
-        scores = self.readout(self.relation_encoder(r)).squeeze(-1)  # (N, K)
+        pn = F.normalize(protos, dim=-1, p=2)  # (K, M, E); invalid slots are masked out below
+        k, m = valid.shape
+        n = qn.shape[0]
+        absent = ~valid.any(dim=1)  # (K,) classes with no real example
+        # (1) each query attends to each class's valid slots. An absent class (all invalid) would leave
+        # an all-ignored row -> NaN softmax, so leave its row fully unmasked (its zero-filled slots); the
+        # resulting context is discarded below, so its value is irrelevant.
+        cross_ignore = ~valid & ~absent[:, None]  # (K, M), True = ignore
+        ctx = self.cross_attn(
+            qn[None].expand(k, n, e).contiguous(), pn, pn, key_padding_mask=cross_ignore, need_weights=False
+        )[0]  # (K, N, E)
+        ctx = ctx.transpose(0, 1)  # (N, K, E)
+        ctx = self.norm1(qn[:, None, :] + ctx)  # residual: the query enters the logit directly
+        ctx = self.norm2(ctx + self.ffn(ctx))
+        # (2) mix the K context vectors across classes (per query); mask absent classes out as keys so
+        # present classes never attend them - an absent class is invisible to the rest of the graph.
+        ctx = self.class_mixer(ctx, src_key_padding_mask=absent[None, :].expand(n, k))  # (N, K, E)
+        # (3) read out one scalar per class, forcing absent classes to -inf (probability exactly 0).
+        scores = self.readout(ctx).squeeze(-1).masked_fill(absent, float("-inf"))  # (N, K)
         logits = torch.cat([scores, self.nota_bias.expand(n, 1)], dim=-1)  # (N, K+1)
         return logits.reshape(*lead, k + 1)
 

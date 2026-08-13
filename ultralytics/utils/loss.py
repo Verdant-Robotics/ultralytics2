@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -708,9 +709,11 @@ class PosePromptLoss(v8PoseLoss):
     Adds a 7th loss term (order: box, pose, kobj, cls, dfl, attr, abc). The ABC term is built from
     within-batch, within-family episodes (see calculate_abc_loss):
       * within each family the labelled clusters are randomly partitioned into up to abc_num_slots
-        classes (each a set of one or more clusters), padded with an "empty" sentinel;
-      * each class prototype is a random positive mixture of its clusters' embeddings;
-      * every foreground anchor is classified by the head's abc_head against those class prototypes
+        classes (each a set of one or more clusters);
+      * each class is a SET of example embeddings (a random subset of its clusters' members), padded to
+        abc_num_examples slots with a boolean validity mask (padding contents are masked out; an
+        all-False row is an absent class);
+      * every foreground anchor is classified by the head's abc_head against those class example sets
         with a partial-label (allowed-set) masked-softmax loss that exploits the cluster sign
         convention (0 = unknown, >0 = known non-exhaustive, <0 = known exhaustive).
 
@@ -724,12 +727,12 @@ class PosePromptLoss(v8PoseLoss):
         super().__init__(model)
         self.abc_head = model.model[-1].abc_head
         self.abc_gain = getattr(self.hyp, "abc", 0.5)
-        # Fixed number of prototype slots per episode; unused slots are padded with the empty sentinel
-        # so the net learns its "absent" meaning. Should match export num_protos (deploy max classes).
+        # Fixed number of class slots per episode; a class with no examples (all-False validity row) is
+        # scored absent by the head. Should match export num_protos (deploy max classes).
         self.abc_num_slots = getattr(self.hyp, "abc_num_slots", 3)
-        # Concentration of the per-cluster stick-breaking mixture (see calculate_abc_loss). Smaller =
-        # prototypes built from fewer members regardless of how many are present; a=1 => Beta(1,1)=Uniform.
-        self.abc_stick_alpha = getattr(self.hyp, "abc_stick_alpha", 1.0)
+        # Max example embeddings per class slot (M): each class is a validity-masked SET of examples.
+        # Fixed here and at export so the what-if net's prototype tensor has a static shape.
+        self.abc_num_examples = getattr(self.hyp, "abc_num_examples", 16)
 
     def __call__(self, preds, batch):
         """Compute the total loss (box, pose, kobj, cls, dfl, attr, abc)."""
@@ -812,16 +815,17 @@ class PosePromptLoss(v8PoseLoss):
         Per family: gather all foreground anchor embeddings and their clusters, then partition the
         available clusters into a RANDOM number (1..min(n_clusters, abc_num_slots)) of non-overlapping
         classes - each class is a SET of one or more clusters (multi-cluster classes), and some clusters
-        are left unassigned so their queries become NOTA. Each cluster gets a random positive-mixture
-        prototype (Exponential(1) weight per member), L2-normalized so cluster size does not matter and
-        scaled by a random weight in [1, 10]; a class prototype is the sum of its clusters' prototypes
-        (so several clusters can share a class, each contributing a random amount). The prototype set is
-        padded to abc_num_slots slots with the "empty" sentinel (1, 0, ..., 0). Every foreground
-        anchor is then classified against those slots with a partial-label (allowed-set) masked-softmax
-        loss; sentinel (padding) slots are never an allowed label, so the net learns the sentinel means
-        "class absent". Randomising the class count and cluster-to-class assignment directly trains the
-        arbitrary-subset behaviour used at inference. No support/query split: prototypes and queries
-        share the same pool; the random mixture keeps a prototype from collapsing onto a single query.
+        are left unassigned so their queries become NOTA. Each class is then a SET of example embeddings:
+        for every cluster in the class we include min(N+1, 10, max(1, C-1)) random members (N ~ Geom(0.5),
+        C = member count) as raw example embeddings (no averaging - so a query of one cluster is not
+        washed out by many examples of another), padded to abc_num_examples slots with a boolean validity
+        mask marking the real slots. Every foreground anchor is then classified against those class sets
+        with a partial-label (allowed-set) masked-softmax loss; padding slots are masked out in the head
+        and unassigned/padding classes (all-False rows) are never an allowed label, so the net learns to
+        score them absent. Randomising the class count, cluster-to-class assignment and example count
+        directly trains the arbitrary-subset behaviour used at inference. No support/query split: examples
+        and queries share the same pool (leaving >=1 non-example query per multi-member cluster keeps a
+        non-trivial signal).
 
         Args:
             batch (dict): must contain "cluster" (N,) per-box cluster ids and "family_idx" (B,).
@@ -867,50 +871,6 @@ class PosePromptLoss(v8PoseLoss):
                 continue
             cluster_is_exhaustive = uniq < 0  # (n_ids,) whether each cluster was exhaustively labelled (< 0)
 
-            # Per-cluster random-mixture prototypes (one per cluster, unknown included): combine each
-            # cluster's members with random weights, L2-normalize (so cluster size does not affect the
-            # direction), then scale by a random weight in [1, 10] - modelling a user giving a few-to-many
-            # examples of each cluster when several clusters share a class.
-            # The mixture weights come from truncated Dirichlet-process stick-breaking with concentration
-            # a = abc_stick_alpha (i.e. Dirichlet(a/n, ..., a/n)). Unlike a flat Dirichlet(1, ..., 1) -
-            # whose weights collapse to the near-uniform 1/n mean as the member count n grows (a noisy
-            # average) - this keeps the mass on O(a) members regardless of n, so a prototype can still
-            # look like a single (or few) example(s) when many are present. b_i ~ Beta(1, a),
-            # pi_i = b_i * prod_{j<i}(1 - b_j), with the last (random) member forced to b = 1 so the
-            # leftover stick mass is assigned to it (a=1 => Beta(1,1) => Uniform).
-            n_uniq = uniq.numel()
-            n_mem = cid.shape[0]
-            counts = torch.bincount(cid, minlength=n_uniq)  # members per cluster
-            max_n = int(counts.max())
-            # Lay members out in a (n_uniq, max_n) grid in random order within each cluster (sort by
-            # cluster id + noise), so the decreasing stick weights land on members at random.
-            sort_idx = torch.argsort(cid.float() + torch.rand(n_mem, device=device))
-            scid = cid[sort_idx]
-            ramp = torch.arange(n_mem, device=device)
-            boundary = torch.cat([torch.ones(1, dtype=torch.bool, device=device), scid[1:] != scid[:-1]])
-            col = ramp - torch.where(boundary, ramp, torch.zeros_like(ramp)).cummax(0).values  # position in cluster
-            cols = torch.arange(max_n, device=device)
-            valid = cols[None, :] < counts[:, None]
-            last = cols[None, :] == (counts[:, None] - 1)
-            # Stick weights in the embedding dtype: far-tail members may underflow to 0 under fp16, which
-            # is harmless (their weight is negligible), and the small clusters that matter for aggregation
-            # (n = 2, 3) never underflow. The prototype is L2-normalized below, so lost tail mass is moot.
-            u = torch.rand(n_uniq, max_n, device=device, dtype=emb.dtype)
-            b = 1.0 - (1.0 - u) ** (1.0 / self.abc_stick_alpha)  # Beta(1, a) via inverse CDF
-            b = torch.where(last, torch.ones_like(b), b)
-            b = torch.where(valid, b, torch.zeros_like(b))  # invalid slots: b=0 => (1-b)=1 => pi=0
-            prev = torch.cat(
-                [torch.ones(n_uniq, 1, device=device, dtype=emb.dtype), torch.cumprod(1.0 - b, dim=1)[:, :-1]],
-                dim=1,
-            )  # prod_{j<i}(1 - b_j)
-            pi = b * prev  # (n_uniq, max_n); each cluster's weights sum to 1
-            emb_grid = torch.zeros(n_uniq, max_n, emb.shape[1], device=device, dtype=emb.dtype)
-            emb_grid[scid, col] = emb[sort_idx]  # differentiable scatter: grad flows back to members
-            cproto = (pi[:, :, None] * emb_grid).sum(dim=1)  # (n_uniq, E) per-cluster weighted mixture
-            cproto = F.normalize(cproto, dim=-1) * torch.empty(
-                n_uniq, 1, device=device, dtype=emb.dtype
-            ).uniform_(1.0, 10.0)
-
             # Partition the real clusters into n_real non-overlapping classes (each a set of one or more
             # clusters); some clusters stay unassigned so their queries become NOTA. cls_of_cluster[c] is
             # the class of cluster id c (-1 = unassigned; the unknown cluster is never assigned).
@@ -927,20 +887,37 @@ class PosePromptLoss(v8PoseLoss):
                 rest[rest == n_real] = -1
                 cls_of_cluster[order[n_real:]] = rest
 
-            # Each class prototype is the sum of its clusters' prototypes.
-            assigned = cls_of_cluster >= 0
-            real_protos = torch.zeros(n_real, emb.shape[1], device=device, dtype=emb.dtype)
-            real_protos.index_add_(0, cls_of_cluster[assigned], cproto[assigned])
-
-            # Pad the prototype set to k_max slots with the "empty" sentinel (1, 0, ..., 0).
-            pad = torch.zeros(k_max - n_real, emb.shape[1], device=device, dtype=emb.dtype)
-            pad[:, 0] = 1.0
-            protos = torch.cat([real_protos, pad], 0)  # (k_max, E)
+            # Each class is a SET of example embeddings (not an averaged prototype) - so a class spanning
+            # several clusters keeps them as distinct examples and a query of one cluster is not washed
+            # out by many examples of another. For each cluster in a class include n_ex = min(N+1, 10,
+            # max(1, C-1)) random members (N ~ Geom(0.5), C = member count): a geometric spread of a few
+            # examples that leaves >=1 member as a non-example query when C>1. The (k_max, m_max) grid is
+            # padded to m_max and a boolean `valid` mask marks the real slots; padding contents are
+            # irrelevant (masked out in the head), and a padding class (all-False row) is scored absent.
+            # ALL foreground anchors remain queries (examples included - a trivial but harmless signal).
+            m_max = self.abc_num_examples
+            protos = torch.zeros(k_max, m_max, emb.shape[1], device=device, dtype=emb.dtype)
+            valid = torch.zeros(k_max, m_max, dtype=torch.bool, device=device)
+            fill = [0] * n_real  # next free example slot per class
+            for c in range(uniq.numel()):
+                kc = int(cls_of_cluster[c])
+                if kc < 0:  # unknown or unassigned cluster contributes no example
+                    continue
+                members = (cid == c).nonzero().flatten()
+                cc = int(members.numel())
+                geom = int(torch.rand((), device=device).clamp_min(1e-9).log() / math.log(0.5))  # ~ Geom(0.5)
+                n_ex = min(geom + 1, 10, max(1, cc - 1), m_max - fill[kc])  # respect the per-class m_max cap
+                if n_ex <= 0:
+                    continue
+                sel = members[torch.randperm(cc, device=device)[:n_ex]]
+                protos[kc, fill[kc] : fill[kc] + n_ex] = emb[sel]  # differentiable: grad flows to examples
+                valid[kc, fill[kc] : fill[kc] + n_ex] = True
+                fill[kc] += n_ex
 
             # Run the head with autocast off: emb/protos and the head's params are all fp32, so this
             # keeps the transformer/matmuls consistently fp32 (autocast would otherwise mix fp16/fp32).
             with torch.autocast(device_type=self.device.type, enabled=False):
-                logits = self.abc_head(emb, protos)  # (M, k_max+1)   every fg anchor is a query
+                logits = self.abc_head(emb, protos, valid)  # (M, k_max+1)   every fg anchor is a query
             # Per-anchor class (unknown/unassigned clusters map to -1). A class is exhaustive iff ALL its
             # clusters are; padding slots are marked exhaustive too, so they are never an allowed label
             # and _abc_class_labels already returns the full k_max width.
