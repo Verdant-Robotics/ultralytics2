@@ -903,12 +903,12 @@ class PosePromptLoss(v8PoseLoss):
                 kc = int(cls_of_cluster[c])
                 if kc < 0:  # unknown or unassigned cluster contributes no example
                     continue
+                if fill[kc] >= m_max:  # class already full
+                    continue
                 members = (cid == c).nonzero().flatten()
                 cc = int(members.numel())
                 geom = int(torch.rand((), device=device).clamp_min(1e-9).log() / math.log(0.5))  # ~ Geom(0.5)
                 n_ex = min(geom + 1, 10, max(1, cc - 1), m_max - fill[kc])  # respect the per-class m_max cap
-                if n_ex <= 0:
-                    continue
                 sel = members[torch.randperm(cc, device=device)[:n_ex]]
                 protos[kc, fill[kc] : fill[kc] + n_ex] = emb[sel]  # differentiable: grad flows to examples
                 valid[kc, fill[kc] : fill[kc] + n_ex] = True
