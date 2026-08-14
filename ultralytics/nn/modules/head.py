@@ -403,7 +403,7 @@ class PosePrompt(Pose):
         PosePromptModel.classify_embeddings.
     """
 
-    def __init__(self, nc=80, na=0, kpt_shape=(17, 3), embed_dim=128, ch=()):
+    def __init__(self, nc=80, na=0, kpt_shape=(17, 3), embed_dim=128, abc_num_layers=1, ch=()):
         """Initialize the PosePrompt head.
 
         Args:
@@ -412,6 +412,7 @@ class PosePrompt(Pose):
             kpt_shape (tuple): (num_keypoints, num_dims).
             embed_dim (int): Per-anchor embedding dimension E (should be divisible by the ABC head's
                 number of attention heads, default 4).
+            abc_num_layers (int): Number of stacked decoder blocks in the ABC head (1 = single block).
             ch (tuple): Input channels per FPN level.
         """
         super().__init__(nc, na, kpt_shape, ch)
@@ -420,7 +421,7 @@ class PosePrompt(Pose):
         self.cv_embed = nn.ModuleList(
             nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, embed_dim, 1)) for x in ch
         )
-        self.abc_head = ABCHead(embed_dim, num_heads=4)
+        self.abc_head = ABCHead(embed_dim, num_heads=4, num_layers=abc_num_layers)
 
     def forward(self, x):
         """Return pose predictions plus per-anchor embeddings.

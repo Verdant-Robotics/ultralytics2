@@ -1966,6 +1966,7 @@ def parse_model(d, ch, verbose=True):
     max_channels = float("inf")
     nc, na, seg_ch_num, act, scales = (d.get(x) for x in ("nc", "na", "seg_ch_num", "activation", "scales"))
     embed_dim = d.get("embed_dim")  # per-anchor embedding dim for the pose-prompt (ABC) head
+    abc_num_layers = d.get("abc_num_layers", 1)  # stacked decoder blocks in the pose-prompt ABC head
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
     if scales:

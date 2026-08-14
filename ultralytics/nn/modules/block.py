@@ -830,13 +830,13 @@ class ABCHead(nn.Module):
 
     Each class is a SET of example embeddings (not a single averaged prototype), so a class that spans
     several visually distinct clusters keeps them as distinct examples - a query of one cluster is not
-    washed out by many examples of another. Scoring:
+    washed out by many examples of another. Scoring stacks num_layers decoder blocks; each block is:
       1. each query attends (cross-attention) to a class's example set -> a per-(query, class) context
          vector, followed by a residual + FFN; there is NO between-class mixing at this stage, so each
          class is matched as a set on its own;
       2. a self-attention then mixes the K context vectors ACROSS classes (per query, a residual
-         encoder layer) so each class is scored relative to the other classes present, not in isolation;
-      3. a shared linear readout maps each mixed context vector to a scalar class logit.
+         encoder layer) so each class is scored relative to the other classes present, not in isolation.
+    A shared linear readout maps each final mixed context vector to a scalar class logit.
     NOTA is a single learnable bias competing in the softmax - "none" means "matches no class set" (the
     complement region), so it is not a token in the attention. Match quality is left to what the
     attention learns (no explicit affinity term), so a query can be compatible with several classes
@@ -851,29 +851,39 @@ class ABCHead(nn.Module):
     per class plus the mask (absent-class output columns are already zero).
     """
 
-    def __init__(self, embed_dim: int, num_heads: int):
+    def __init__(self, embed_dim: int, num_heads: int, num_layers: int = 1):
         """Initialize the ABC head.
 
         Args:
             embed_dim (int): Embedding dimension E of query/example vectors.
             num_heads (int): Attention heads for the cross- and cross-class attention layers.
+            num_layers (int): Number of stacked decoder blocks. Each block = (query cross-attends its
+                class's example set + residual + FFN) then (cross-class mixing over the K contexts).
+                Stacking lets the query re-attend the examples using cross-class context. 1 = single block.
         """
         super().__init__()
         self.embed_dim = embed_dim
-        # (1) each query attends to a class's SET of example embeddings (cross-attention), then a
-        # residual + FFN -> a per-(query, class) context vector. No between-class mixing at this stage.
-        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.0, batch_first=True)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2), nn.GELU(), nn.Linear(embed_dim * 2, embed_dim)
+        self.num_layers = num_layers
+        # Per block: (1) each query attends to a class's SET of example embeddings (cross-attention),
+        # then a residual + FFN -> a per-(query, class) context vector (no between-class mixing here);
+        # (2) a cross-class self-attention mixes the K context vectors per query, so each class is scored
+        # relative to the OTHER classes present, not in isolation.
+        self.cross_attn = nn.ModuleList(
+            nn.MultiheadAttention(embed_dim, num_heads, dropout=0.0, batch_first=True) for _ in range(num_layers)
         )
-        self.norm2 = nn.LayerNorm(embed_dim)
-        # (2) cross-class mixing of the K context vectors, separately per query (residual encoder layer):
-        # each class is scored relative to the OTHER classes present, not in isolation.
-        self.class_mixer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2, dropout=0.0, batch_first=True
+        self.norm1 = nn.ModuleList(nn.LayerNorm(embed_dim) for _ in range(num_layers))
+        self.ffn = nn.ModuleList(
+            nn.Sequential(nn.Linear(embed_dim, embed_dim * 2), nn.GELU(), nn.Linear(embed_dim * 2, embed_dim))
+            for _ in range(num_layers)
         )
-        # (3) shared linear readout: mixed context vector -> scalar class logit.
+        self.norm2 = nn.ModuleList(nn.LayerNorm(embed_dim) for _ in range(num_layers))
+        self.class_mixer = nn.ModuleList(
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2, dropout=0.0, batch_first=True
+            )
+            for _ in range(num_layers)
+        )
+        # shared linear readout: final mixed context vector -> scalar class logit.
         self.readout = nn.Linear(embed_dim, 1)
         # NOTA rejection score: a single learnable threshold competing in the softmax.
         self.nota_bias = nn.Parameter(torch.zeros(1))
@@ -900,19 +910,22 @@ class ABCHead(nn.Module):
         k, m = valid.shape
         n = qn.shape[0]
         absent = ~valid.any(dim=1)  # (K,) classes with no real example
-        # (1) each query attends to each class's valid slots. An absent class (all invalid) would leave
-        # an all-ignored row -> NaN softmax, so leave its row fully unmasked (its zero-filled slots); the
-        # resulting context is discarded below, so its value is irrelevant.
+        # An absent class (all invalid) would leave an all-ignored cross-attention row -> NaN softmax, so
+        # leave its row fully unmasked (its zero-filled slots); its context is discarded (masked out of
+        # the mixer and forced to -inf below), so the value is irrelevant.
         cross_ignore = ~valid & ~absent[:, None]  # (K, M), True = ignore
-        ctx = self.cross_attn(
-            qn[None].expand(k, n, e).contiguous(), pn, pn, key_padding_mask=cross_ignore, need_weights=False
-        )[0]  # (K, N, E)
-        ctx = ctx.transpose(0, 1)  # (N, K, E)
-        ctx = self.norm1(qn[:, None, :] + ctx)  # residual: the query enters the logit directly
-        ctx = self.norm2(ctx + self.ffn(ctx))
-        # (2) mix the K context vectors across classes (per query); mask absent classes out as keys so
-        # present classes never attend them - an absent class is invisible to the rest of the graph.
-        ctx = self.class_mixer(ctx, src_key_padding_mask=absent[None, :].expand(n, k))  # (N, K, E)
+        mixer_mask = absent[None, :].expand(n, k)  # (N, K): hide absent classes from the mixer as keys
+        ctx = qn[:, None, :].expand(n, k, e)  # (N, K, E): initial per-class query = the raw query
+        for i in range(self.num_layers):
+            # (1) each query (its current per-class context) attends that class's valid example slots.
+            attn = self.cross_attn[i](
+                ctx.transpose(0, 1).contiguous(), pn, pn, key_padding_mask=cross_ignore, need_weights=False
+            )[0].transpose(0, 1)  # (N, K, E)
+            ctx = self.norm1[i](ctx + attn)  # residual (layer 0: the raw query enters the logit directly)
+            ctx = self.norm2[i](ctx + self.ffn[i](ctx))
+            # (2) mix the K context vectors across classes (per query); absent classes hidden as keys so
+            # present classes never attend them - an absent class is invisible to the rest of the graph.
+            ctx = self.class_mixer[i](ctx, src_key_padding_mask=mixer_mask)  # (N, K, E)
         # (3) read out one scalar per class, forcing absent classes to -inf (probability exactly 0).
         scores = self.readout(ctx).squeeze(-1).masked_fill(absent, float("-inf"))  # (N, K)
         logits = torch.cat([scores, self.nota_bias.expand(n, 1)], dim=-1)  # (N, K+1)
