@@ -179,13 +179,17 @@ def verify_image(args: tuple) -> tuple:
 
 def verify_image_label(args: tuple) -> list:
     """Verify one image-label pair."""
-    im_file, lb_file, prefix, keypoint, num_cls, num_attributes, nkpt, ndim, single_cls = args
-    num_classifications = 1 + num_attributes
+    im_file, lb_file, prefix, keypoint, num_cls, num_attributes, has_cluster, nkpt, ndim, single_cls = args
+    num_classifications = 1 + num_attributes  # class + attributes, before the box
+    num_cluster = 1 if has_cluster else 0  # optional trailing per-box cluster id column
+    # Line layout: [class, attr_0..attr_{na-1}, x, y, w, h, kpt..., cluster?]. The per-box cluster id
+    # (present iff has_cluster) is the LAST column and is kept in place throughout; the keypoint slice
+    # is explicitly bounded so it is never swept into the keypoints.
     # Number of columns expected in each label file. Exceptions:
     # - It is acceptable for a label file to contain no keypoints even if keypoint is true.
     # - It is acceptable for a label file to contain a segmentation outline instead of a bounding
     #   box when keypoint is false, in which case the segmentation is converted to a bounding box.
-    num_expected_columns = num_classifications + 4 + nkpt * ndim  # classifications + box + keypoints
+    num_expected_columns = num_classifications + 4 + nkpt * ndim + num_cluster
     # Number (missing, found, empty, corrupt), message, segments, keypoints
     nm, nf, ne, nc, msg, segments, keypoints, ignore_kpt = 0, 0, 0, 0, "", [], None, None
     try:
@@ -219,15 +223,15 @@ def verify_image_label(args: tuple) -> list:
                 assert box_xywh.max() <= 1, f'Box coordinates should be in [0, 1]. Found {box_xywh[box_xywh > 1]}'
                 assert box_xywh.min() >= 0, f'Box coordinates should be in [0, 1]. Found {box_xywh[box_xywh < 0]}'
                 if keypoint:
-                    # Check if we have keypoints in the label file
-                    keypoints = lb[:, num_classifications + 4:].reshape(-1, ndim)[:, :2]
-                    if lb.shape[1] == num_classifications + 4:
+                    if lb.shape[1] == num_classifications + 4 + num_cluster:  # box (+ cluster), no keypoints
                         ignore_kpt = True
                     else:
                         assert lb.shape[1] == num_expected_columns, f'Found {lb.shape[1]} columns. Expected {num_expected_columns}'
                         ignore_kpt = False
-                        assert keypoints.max() <= 1, f'Keypoint coordinates should be in [0, 1]. Found {keypoints[keypoints > 1]}'
-                        assert keypoints.min() >= 0, f'Keypoint coordinates should be in [0, 1]. Found {keypoints[keypoints < 0]}'
+                        # Validate the keypoint block (only present in this branch, so reshape is safe).
+                        kpts = lb[:, num_classifications + 4 : num_classifications + 4 + nkpt * ndim].reshape(-1, ndim)[:, :2]
+                        assert kpts.max() <= 1, f'Keypoint coordinates should be in [0, 1]. Found {kpts[kpts > 1]}'
+                        assert kpts.min() >= 0, f'Keypoint coordinates should be in [0, 1]. Found {kpts[kpts < 0]}'
 
                 # All labels
                 class_labels = lb[:, 0]
@@ -239,7 +243,7 @@ def verify_image_label(args: tuple) -> list:
                 assert class_labels.min() >= 0, f'Negative class labels found: {class_labels[class_labels < 0]}'
                 _, i = np.unique(lb, axis=0, return_index=True)
                 if len(i) < nl:  # duplicate row check
-                    lb = lb[i]  # remove duplicates
+                    lb = lb[i]  # remove duplicates (cluster is a column of lb, so it stays aligned)
                     if segments:
                         segments = [segments[x] for x in i]
                     msg = f'{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed file {lb_file}'
@@ -258,11 +262,17 @@ def verify_image_label(args: tuple) -> list:
                 num_of_boxes = len(lb)
                 keypoints = np.zeros((num_of_boxes, nkpt, ndim), dtype=np.float32)
             else:
-                keypoints = lb[:, num_classifications + 4:].reshape(-1, nkpt, ndim)
+                keypoints = lb[:, num_classifications + 4 : num_classifications + 4 + nkpt * ndim].reshape(-1, nkpt, ndim)
                 if ndim == 2:
                     kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
                     keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
-        lb = lb[:, :num_classifications + 4]
+        # Drop the keypoint columns (returned separately in `keypoints`) but keep the trailing cluster
+        # column if present -> returned layout [class, attrs, box, cluster?]. The cluster is the last
+        # column of the file row (has_cluster implies a keypoint task; the column count is checked above).
+        if has_cluster:
+            lb = np.concatenate([lb[:, :num_classifications + 4], lb[:, -1:]], axis=1)
+        else:
+            lb = lb[:, :num_classifications + 4]
         return im_file, lb, shape, segments, keypoints, ignore_kpt, nm, nf, ne, nc, msg
     except Exception as e:
         nc = 1
@@ -460,6 +470,9 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
         data["attribute_names"] = {i: f"class_{i}" for i in range(data["na"])}
     else:
         data["na"] = len(data["attribute_names"])
+    # Whether each label row carries a per-box cluster id as its LAST column:
+    # [class, attr_0..attr_{na-1}, x, y, w, h, kpt..., cluster]. Used by the pose-prompt task.
+    data["has_cluster"] = bool(data.get("has_cluster", False))
     data["channels"] = data.get("channels", 3)  # get image channels, default to 3
 
     # Resolve paths

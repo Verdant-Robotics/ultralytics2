@@ -5,7 +5,7 @@ import os
 import argparse
 
 
-def Export(checkpoint_file_path):
+def Export(checkpoint_file_path, num_protos=3):
     if os.path.exists(checkpoint_file_path):
         model = GiveModel(checkpoint_file_path)
     else:
@@ -26,6 +26,14 @@ def Export(checkpoint_file_path):
 
     path = model.export(format="onnx", imgsz=[768, 768], opset=12)
 
+    # Pose-prompt only: the example-conditioned ("what-if") ABC model. It runs on cached per-box
+    # embeddings + example prototypes (no image), so there are no image-size variants - one file.
+    # opset 16 (the transformer's MultiheadAttention needs >= 13; runs under ONNX Runtime / TRT <= 16).
+    if hasattr(model.model, "export_abc_onnx"):
+        out = f"{base_path}/{prefix}_prompt.onnx"
+        model.model.export_abc_onnx(out, num_protos=num_protos, opset=16)
+        print(f"Exported what-if ABC model to {out}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export the model")
@@ -35,6 +43,12 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="Path to the model weight checkpoint; This model will be exported")
+    parser.add_argument(
+        "--num-protos",
+        type=int,
+        default=3,
+        help="pose-prompt only: number of class prototype slots baked into the what-if ABC model "
+             "(the max number of A/B/C classes; drop a class at runtime with the empty sentinel)")
 
     args = parser.parse_args()
-    Export(args.checkpoint_path)
+    Export(args.checkpoint_path, num_protos=args.num_protos)

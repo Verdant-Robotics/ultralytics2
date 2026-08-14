@@ -33,6 +33,7 @@ from .block import (
     A2C2f,
     AConv,
     ADown,
+    ABCHead,
     Attention,
     BNContrastiveHead,
     Bottleneck,
@@ -90,6 +91,8 @@ from .head import (
     v10Detect,
     PoseSeg,
     BoxInst,
+    PosePrompt,
+    ABCNet,
 )
 from .transformer import (
     AIFI,
@@ -124,6 +127,7 @@ __all__ = (
     "A2C2f",
     "AConv",
     "ADown",
+    "ABCHead",
     "Attention",
     "BNContrastiveHead",
     "Bottleneck",
@@ -183,4 +187,6 @@ __all__ = (
     "v10Detect",
     "PoseSeg",
     "BoxInst",
+    "PosePrompt",
+    "ABCNet",
 )

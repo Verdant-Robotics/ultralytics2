@@ -702,6 +702,251 @@ class v8PoseLoss(v8DetectionLoss):
         return kpts_loss, kpts_obj_loss
     
 
+class PosePromptLoss(v8PoseLoss):
+    """v8PoseLoss extended with an episodic, example-conditioned few-shot ("ABC") loss.
+
+    Adds a 7th loss term (order: box, pose, kobj, cls, dfl, attr, abc). The ABC term is built from
+    within-batch, within-family episodes (see calculate_abc_loss):
+      * within each family the labelled clusters are randomly partitioned into up to abc_num_slots
+        classes (each a set of one or more clusters), padded with an "empty" sentinel;
+      * each class prototype is a random positive mixture of its clusters' embeddings;
+      * every foreground anchor is classified by the head's abc_head against those class prototypes
+        with a partial-label (allowed-set) masked-softmax loss that exploits the cluster sign
+        convention (0 = unknown, >0 = known non-exhaustive, <0 = known exhaustive).
+
+    No hooks or assigner wrapping: the embeddings are a first-class head output (pred_embed) and
+    the assignment (fg_mask / target_gt_idx) is a local computed here, exactly as
+    calculate_attribute_loss already consumes it.
+    """
+
+    def __init__(self, model):
+        """Initialize PosePromptLoss and cache a reference to the head's ABC module."""
+        super().__init__(model)
+        self.abc_head = model.model[-1].abc_head
+        self.abc_gain = getattr(self.hyp, "abc", 0.5)
+        # Fixed number of prototype slots per episode; unused slots are padded with the empty sentinel
+        # so the net learns its "absent" meaning. Should match export num_protos (deploy max classes).
+        self.abc_num_slots = getattr(self.hyp, "abc_num_slots", 3)
+
+    def __call__(self, preds, batch):
+        """Compute the total loss (box, pose, kobj, cls, dfl, attr, abc)."""
+        loss = torch.zeros(7, device=self.device)  # box, pose, kobj, cls, dfl, attr, abc
+        feats, pred_kpts, pred_embed = preds if isinstance(preds[0], list) else preds[1]
+        batch_size = feats[0].shape[0]
+        pred_distri, pred_scores, pred_attributes = torch.cat(
+            [xi.view(batch_size, self.no, -1) for xi in feats], 2
+        ).split((self.reg_max * 4, self.nc, self.na), 1)
+
+        loss = self.calculate_bbox_kpt_loss(
+            loss, batch, feats, pred_distri, pred_scores, pred_attributes, pred_kpts, pred_embed
+        )
+        return loss.sum() * batch_size, loss.detach()
+
+    def calculate_bbox_kpt_loss(
+        self, loss, batch, feats, pred_distri, pred_scores, pred_attributes, pred_kpts, pred_embed
+    ):
+        """Standard pose losses (mirrors v8PoseLoss) plus the ABC loss, sharing one assignment."""
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_attributes = pred_attributes.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        pred_kpts = pred_kpts.permute(0, 2, 1).contiguous()
+        pred_embed = pred_embed.permute(0, 2, 1).contiguous()  # (B, A, E)
+
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        batch_size = pred_scores.shape[0]
+        batch_idx = batch["batch_idx"].view(-1, 1)
+        targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        pred_kpts_dec = self.kpts_decode(anchor_points, pred_kpts.view(batch_size, -1, *self.kpt_shape))
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[4] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+            keypoints = batch["keypoints"].to(self.device).float().clone()
+            keypoints[..., 0] *= imgsz[1]
+            keypoints[..., 1] *= imgsz[0]
+            loss[1], loss[2] = self.calculate_keypoints_loss(
+                fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts_dec,
+                batch["ignore_kpt"],
+            )
+            if "attributes" in batch:
+                loss[5] = self.calculate_attribute_loss(batch, pred_attributes, target_gt_idx, fg_mask)
+            if "cluster" in batch and "family_idx" in batch:
+                loss[6] = self.calculate_abc_loss(batch, pred_embed, fg_mask, target_gt_idx)
+
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.pose
+        loss[2] *= self.hyp.kobj
+        loss[3] *= self.hyp.cls
+        loss[4] *= self.hyp.dfl
+        loss[5] *= self.hyp.attr
+        loss[6] *= self.abc_gain
+        return loss
+
+    def calculate_abc_loss(self, batch, pred_embed, fg_mask, target_gt_idx):
+        """Episodic partial-label few-shot loss.
+
+        Per family: gather all foreground anchor embeddings and their clusters, then partition the
+        available clusters into a RANDOM number (1..min(n_clusters, abc_num_slots)) of non-overlapping
+        classes - each class is a SET of one or more clusters (multi-cluster classes), and some clusters
+        are left unassigned so their queries become NOTA. Each cluster gets a random positive-mixture
+        prototype (Exponential(1) weight per member), L2-normalized so cluster size does not matter and
+        scaled by a random weight in [1, 10]; a class prototype is the sum of its clusters' prototypes
+        (so several clusters can share a class, each contributing a random amount). The prototype set is
+        padded to abc_num_slots slots with the "empty" sentinel (1, 0, ..., 0). Every foreground
+        anchor is then classified against those slots with a partial-label (allowed-set) masked-softmax
+        loss; sentinel (padding) slots are never an allowed label, so the net learns the sentinel means
+        "class absent". Randomising the class count and cluster-to-class assignment directly trains the
+        arbitrary-subset behaviour used at inference. No support/query split: prototypes and queries
+        share the same pool; the random mixture keeps a prototype from collapsing onto a single query.
+
+        Args:
+            batch (dict): must contain "cluster" (N,) per-box cluster ids and "family_idx" (B,).
+            pred_embed (torch.Tensor): (B, A, E) per-anchor embeddings.
+            fg_mask (torch.Tensor): (B, A) bool, foreground (matched) anchors.
+            target_gt_idx (torch.Tensor): (B, A) index of the assigned GT per anchor.
+
+        Returns:
+            (torch.Tensor): scalar ABC loss (0 if no family has a labelled cluster).
+        """
+        device = self.device
+        B = fg_mask.shape[0]
+        k_max = self.abc_num_slots
+        # Compute the episode in the ABC head's own parameter dtype (fp32 in training; fp16 when the
+        # validator runs a half() model under AMP). Matching it avoids fp32/fp16 clashes in index_add_
+        # and the head's matmuls; the head call below also runs with autocast off so nothing re-casts.
+        abc_dtype = next(self.abc_head.parameters()).dtype
+
+        # cluster per GT box -> per anchor (same GT ordering the assigner used)
+        flat_cluster = batch["cluster"].to(device).view(-1, 1).float()
+        gt_clusters = self.unflatten_batch(flat_cluster, batch["batch_idx"].view(-1, 1), B)[..., 0].long()  # (B, maxb)
+        cluster_per_anchor = torch.gather(gt_clusters, 1, target_gt_idx)  # (B, A)
+
+        family_idx = batch["family_idx"]
+        family_idx = family_idx.to(device) if torch.is_tensor(family_idx) else torch.as_tensor(family_idx, device=device)
+
+        total_loss = torch.zeros((), device=device)
+        n_terms = 0
+
+        for fam in torch.unique(family_idx):
+            m = (family_idx == fam)[:, None] & fg_mask  # (B, A) foreground anchors in this family
+            emb = pred_embed[m].to(abc_dtype)  # (M, E), matches the ABC head's parameter dtype
+            clu = cluster_per_anchor[m]        # (M,)
+
+            # Map the signed cluster ids to compact ids in one pass: torch.unique's inverse IS the
+            # value->id map already applied to every anchor (no per-anchor binary search). `cid` indexes
+            # everything below directly. The unknown cluster (id 0) is just another id here - it gets a
+            # prototype too, but is simply never assigned to a class.
+            uniq, cid = torch.unique(clu, return_inverse=True)  # uniq sorted; cid (M,) in 0..len(uniq)-1
+            real = uniq != 0  # (n_ids,) which cluster ids are real examples (not the unknown cluster)
+            n_clusters = int(real.sum())
+            if n_clusters == 0:
+                continue
+            cluster_is_exhaustive = uniq < 0  # (n_ids,) whether each cluster was exhaustively labelled (< 0)
+
+            # Per-cluster random-mixture prototypes (one per cluster, unknown included): sum each cluster's
+            # members with Exponential(1) weights, L2-normalize (so cluster size does not matter), then
+            # scale by a random weight in [1, 10] - modelling a user giving a few-to-many examples of each
+            # cluster when several clusters share a class.
+            w = torch.empty(cid.shape[0], device=device, dtype=emb.dtype).exponential_(1.0)
+            cproto = torch.zeros(uniq.numel(), emb.shape[1], device=device, dtype=emb.dtype)
+            cproto.index_add_(0, cid, w[:, None] * emb)  # per-cluster Exp-weighted sum
+            cproto = F.normalize(cproto, dim=-1) * torch.empty(
+                uniq.numel(), 1, device=device, dtype=emb.dtype
+            ).uniform_(1.0, 10.0)
+
+            # Partition the real clusters into n_real non-overlapping classes (each a set of one or more
+            # clusters); some clusters stay unassigned so their queries become NOTA. cls_of_cluster[c] is
+            # the class of cluster id c (-1 = unassigned; the unknown cluster is never assigned).
+            n_real = int(torch.randint(1, min(n_clusters, k_max) + 1, (1,), device=device))
+            order = real.nonzero().flatten()[torch.randperm(n_clusters, device=device)]  # shuffled real ids
+            cls_of_cluster = torch.full((uniq.numel(),), -1, dtype=torch.long, device=device)
+            cls_of_cluster[order[:n_real]] = torch.arange(n_real, device=device)  # seed one cluster per class
+            if n_clusters > n_real:
+                rest = torch.randint(0, n_real + 1, (n_clusters - n_real,), device=device)  # n_real => unassigned
+                rest[rest == n_real] = -1
+                cls_of_cluster[order[n_real:]] = rest
+
+            # Each class prototype is the sum of its clusters' prototypes.
+            assigned = cls_of_cluster >= 0
+            real_protos = torch.zeros(n_real, emb.shape[1], device=device, dtype=emb.dtype)
+            real_protos.index_add_(0, cls_of_cluster[assigned], cproto[assigned])
+
+            # Pad the prototype set to k_max slots with the "empty" sentinel (1, 0, ..., 0).
+            pad = torch.zeros(k_max - n_real, emb.shape[1], device=device, dtype=emb.dtype)
+            pad[:, 0] = 1.0
+            protos = torch.cat([real_protos, pad], 0)  # (k_max, E)
+
+            # Run the head with autocast off: emb/protos and the head's params are all fp32, so this
+            # keeps the transformer/matmuls consistently fp32 (autocast would otherwise mix fp16/fp32).
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                logits = self.abc_head(emb, protos)  # (M, k_max+1)   every fg anchor is a query
+            # Per-anchor class (unknown/unassigned clusters map to -1). A class is exhaustive iff ALL its
+            # clusters are; padding slots are marked exhaustive too, so they are never an allowed label
+            # and _abc_class_labels already returns the full k_max width.
+            cls_of_query = cls_of_cluster[cid]
+            class_is_exhaustive = torch.ones(k_max, dtype=torch.bool, device=device)
+            for k in range(n_real):
+                class_is_exhaustive[k] = cluster_is_exhaustive[cls_of_cluster == k].all()
+            labels = self._abc_class_labels(cls_of_query, clu == 0, class_is_exhaustive)  # (M, k_max+1)
+            # A query is "trivial" when every class is an allowed label (nothing excluded, so num == den);
+            # drop those from the mean. Not all are trivial: the >=1 seeded cluster gives a matched query.
+            trivial = labels.all(dim=1)
+
+            neg_inf = torch.finfo(logits.dtype).min
+            num = torch.logsumexp(logits.masked_fill(~labels, neg_inf), dim=1)
+            den = torch.logsumexp(logits, dim=1)
+            per_query = den - num  # -log(sum_{S} softmax) >= 0
+            total_loss = total_loss + per_query[~trivial].mean()
+            n_terms += 1
+
+        return total_loss / n_terms if n_terms else torch.zeros((), device=device)
+
+    @staticmethod
+    def _abc_class_labels(cls_of_query, is_unknown, class_is_exhaustive):
+        """Build the (M, K+1) boolean class-label mask (K class slots + NOTA).
+
+        Inputs (M = number of query anchors, K = number of class slots):
+          cls_of_query (M,):        class index of each query's cluster (-1 = unassigned / not an example)
+          is_unknown (M,):          queries whose cluster is unknown (cluster 0)
+          class_is_exhaustive (K,): classes whose clusters are ALL exhaustively labelled
+        Allowed labels per query:
+          known, in class k         -> {k}
+          known, in no class        -> {NOTA}
+          unknown (cluster 0)        -> {NOTA} U {classes that are NOT fully exhaustive}
+        (An unknown plant cannot be an exhaustively-labelled cluster, so fully-exhaustive classes are
+        excluded for it.)
+        """
+        M, n_cls = cls_of_query.shape[0], class_is_exhaustive.shape[0]
+        nota = n_cls
+        labels = torch.zeros(M, n_cls + 1, dtype=torch.bool, device=cls_of_query.device)
+        matched = cls_of_query >= 0  # in a class (unknown queries have cls_of_query == -1, so this implies known)
+        labels[matched, cls_of_query[matched]] = True  # in a class -> that class
+        labels[~matched, nota] = True  # not in a class (known-but-unassigned, or unknown) -> NOTA
+        labels[:, :n_cls] |= is_unknown[:, None] & ~class_is_exhaustive[None, :]  # unknown -> also non-exhaustive classes
+        return labels
+
+
 class v8PoseSegLoss(v8PoseLoss):
     class PredE(Enum):
         FEAT = 0

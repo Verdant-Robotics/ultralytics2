@@ -81,7 +81,7 @@ class YOLODataset(BaseDataset):
             **kwargs (Any): Additional keyword arguments for the parent class.
         """
         self.use_segments = task == "segment"
-        self.use_keypoints = task == "pose" or task == "pose-segmentation" or task == "box-inst"
+        self.use_keypoints = task == "pose" or task == "pose-segmentation" or task == "box-inst" or task == "pose-prompt"
         self.use_obb = task == "obb"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
@@ -103,6 +103,7 @@ class YOLODataset(BaseDataset):
         nkpt, ndim = self.data.get("kpt_shape", (0, 0))
         num_classes = len(self.data['names'])
         num_attributes = len(self.data['attribute_names']) if 'attribute_names' in self.data else 0
+        has_cluster = bool(self.data.get('has_cluster', False))
         if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):
             raise ValueError(
                 "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
@@ -118,6 +119,7 @@ class YOLODataset(BaseDataset):
                     repeat(self.use_keypoints),
                     repeat(num_classes),
                     repeat(num_attributes),
+                    repeat(has_cluster),
                     repeat(nkpt),
                     repeat(ndim),
                     repeat(self.single_cls),
@@ -130,19 +132,22 @@ class YOLODataset(BaseDataset):
                 ne += ne_f
                 nc += nc_f
                 if im_file:
-                    x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "shape": shape,
-                            "cls": lb[:, 0:1 + num_attributes],  # n, 1 + na
-                            "bboxes": lb[:, 1 + num_attributes:1 + num_attributes + 4],  # n, 4
-                            "segments": segments,
-                            "keypoints": keypoints,
-                            "ignore_kpt": ignore_kpt,
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
-                    )
+                    label = {
+                        "im_file": im_file,
+                        "shape": shape,
+                        "cls": lb[:, 0:1 + num_attributes],  # n, 1 + na  (class + attributes)
+                        "bboxes": lb[:, 1 + num_attributes:1 + num_attributes + 4],  # n, 4
+                        "segments": segments,
+                        "keypoints": keypoints,
+                        "ignore_kpt": ignore_kpt,
+                        "normalized": True,
+                        "bbox_format": "xywh",
+                    }
+                    # Per-box cluster id: verify_image_label returns layout [class, attrs, box, cluster]
+                    # when has_cluster, so the cluster is at the fixed column after the box.
+                    if has_cluster:
+                        label["cluster"] = lb[:, 1 + num_attributes + 4].astype(np.int64)  # n,
+                    x["labels"].append(label)
                 if msg:
                     msgs.append(msg)
                 pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
@@ -313,6 +318,74 @@ class YOLODataset(BaseDataset):
             new_batch["batch_idx"][i] += i  # add target image index for build_targets()
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
+
+
+class PosePromptDataset(YOLODataset):
+    """YOLODataset for the "pose-prompt" task.
+
+    Adds two signals used by the episodic few-shot ("ABC") head:
+      * per-box cluster - the LAST column of each label file (present when the data
+        config sets has_cluster: true), loaded into the label cache by
+        verify_image_label/cache_labels. Sign convention: 0 = unknown, >0 = known
+        non-exhaustive, <0 = known exhaustive. It is carried through augmentation by riding in the
+        cls array (dropped together with its box on filtering) and popped back out after
+        Format, then collated to a flat per-box batch["cluster"].
+      * per-image family_idx - an integer derived from the image's immediate parent directory
+        (the "family"); collated to a stacked batch["family_idx"]. Cluster ids are comparable
+        only within a family.
+    """
+
+    def __init__(self, *args, data: dict | None = None, task: str = "pose-prompt", **kwargs):
+        """Initialize and build the image-index -> family-id map from parent directory names."""
+        super().__init__(*args, data=data, task=task, **kwargs)
+        families = sorted({Path(p).parent.name for p in self.im_files})
+        self._family_to_id = {name: i for i, name in enumerate(families)}
+        self._img_family_id = [self._family_to_id[Path(p).parent.name] for p in self.im_files]
+
+    def update_labels(self, include_class):
+        """Filter the cluster array with the same box mask used for cls/bboxes."""
+        if include_class is not None:
+            include_class_array = np.array(include_class).reshape(1, -1)
+            for i, label in enumerate(self.labels):
+                if "cluster" in label:
+                    j = (label["cls"] == include_class_array).any(1)
+                    self.labels[i]["cluster"] = label["cluster"][j]
+        super().update_labels(include_class)
+
+    def get_image_and_label(self, index: int) -> dict:
+        """Append cluster onto cls so it rides through augmentation with its box.
+
+        Always appends a column (0 = unknown when the dataset has no cluster labels) so the split in
+        __getitem__ is uniform regardless of dataset/image.
+        """
+        label = super().get_image_and_label(index)
+        n = len(label["cls"])
+        cluster = self.labels[index].get("cluster")
+        if cluster is None or len(cluster) != n:
+            cluster = np.zeros(n, dtype=np.float32)
+        label["cls"] = np.concatenate(
+            [label["cls"], cluster.astype(np.float32).reshape(-1, 1)], axis=1
+        )  # [class | attr0..attr_{na-1} | cluster]
+        return label
+
+    def __getitem__(self, index: int) -> dict:
+        """Split the cluster column back out of attributes and attach family_idx."""
+        sample = super().__getitem__(index)
+        attrs = sample["attributes"]  # (n_boxes, na + 1)
+        sample["cluster"] = attrs[:, -1].long()
+        sample["attributes"] = attrs[:, :-1].contiguous()
+        sample["family_idx"] = torch.tensor(self._img_family_id[index], dtype=torch.long)
+        return sample
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Collate, concatenating cluster (per-box) and stacking family_idx (per-image)."""
+        clusters = [b.pop("cluster") for b in batch]
+        families = [b.pop("family_idx") for b in batch]
+        collated = YOLODataset.collate_fn(batch)
+        collated["cluster"] = torch.cat(clusters, 0)
+        collated["family_idx"] = torch.stack(families, 0)
+        return collated
 
 
 class YOLOMultiModalDataset(YOLODataset):

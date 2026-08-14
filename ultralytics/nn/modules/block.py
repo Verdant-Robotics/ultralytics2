@@ -28,6 +28,7 @@ __all__ = (
     "AConv",
     "ADown",
     "Attention",
+    "ABCHead",
     "BNContrastiveHead",
     "Bottleneck",
     "BottleneckCSP",
@@ -817,6 +818,69 @@ class BNContrastiveHead(nn.Module):
 
         x = torch.einsum("bchw,bkc->bkhw", x, w)
         return x * self.logit_scale.exp() + self.bias
+
+
+class ABCHead(nn.Module):
+    """Example-conditioned few-shot classification head (the "ABC head").
+
+    A pure function of embeddings: given per-anchor query embeddings and a small set of per-class
+    example prototype embeddings, it outputs one logit per class plus a "none-of-the-above" (NOTA)
+    logit. It is shape-agnostic in the leading dims, so it can be called both systematically over an
+    anchor grid and standalone on a flat list of cached embeddings (the "what-if" path).
+
+    A tiny self-attention contextualizes the K prototype tokens among themselves
+    (permutation-equivariant, so the discriminative axis can depend on the SET of classes), then each
+    class logit is a scaled cosine similarity between the query and its contextualized prototype. NOTA
+    is a learnable rejection score, NOT a prototype - "none" means "far from ALL examples" (the
+    complement region), not "close to a particular vector".
+
+    Runtime subset selection uses a learned convention rather than any masking: a prototype slot that
+    holds the fixed "empty" sentinel (1, 0, ..., 0) (a normalize-safe unit vector) is trained to
+    mean "class absent" - the net learns not to let it disturb the real prototypes and to give it a
+    low score. There is no mask input; deployment simply fills absent slots with the sentinel (and can
+    drop those output columns and renormalize for an exact guarantee).
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        """Initialize the ABC head.
+
+        Args:
+            embed_dim (int): Embedding dimension E of query/prototype vectors.
+            num_heads (int): Attention heads for the prototype self-attention.
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        # Permutation-equivariant set function over the prototype tokens (self-attention + FFN).
+        self.proto_encoder = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2, dropout=0.0, batch_first=True
+        )
+        # Cosine-similarity temperature and bias (as in ContrastiveHead).
+        self.logit_scale = nn.Parameter(torch.ones([]) * torch.tensor(1 / 0.07).log())
+        self.bias = nn.Parameter(torch.tensor([0.0]))
+        # NOTA rejection score: a single learnable threshold competing in the softmax.
+        self.nota_bias = nn.Parameter(torch.zeros(1))
+
+    def contextualize(self, protos: torch.Tensor) -> torch.Tensor:
+        """Contextualize the K prototype tokens among themselves. protos (K, E) -> (K, E)."""
+        return self.proto_encoder(protos.unsqueeze(0)).squeeze(0)
+
+    def forward(self, q: torch.Tensor, protos: torch.Tensor) -> torch.Tensor:
+        """Classify query embeddings against example prototypes.
+
+        Args:
+            q (torch.Tensor): Query embeddings, shape (..., E) for any leading dims.
+            protos (torch.Tensor): Example prototypes, shape (K, E). Absent classes are represented by
+                the "empty" sentinel (1, 0, ..., 0) (handled by learning, not masking).
+
+        Returns:
+            (torch.Tensor): Logits of shape (..., K+1): K class logits followed by the NOTA logit.
+        """
+        protos = self.contextualize(protos)
+        qn = F.normalize(q, dim=-1, p=2)
+        pn = F.normalize(protos, dim=-1, p=2)
+        sims = torch.matmul(qn, pn.transpose(-1, -2)) * self.logit_scale.exp() + self.bias  # (..., K)
+        s_nota = self.nota_bias.expand(*q.shape[:-1], 1)
+        return torch.cat([sims, s_nota], dim=-1)  # (..., K+1)
 
 
 class RepBottleneck(Bottleneck):

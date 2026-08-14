@@ -21,6 +21,7 @@ from ultralytics.nn.tasks import (
     YOLOESegModel,
     PoseSegModel,
     BoxInstModel,
+    PosePromptModel,
 )
 from ultralytics.utils import ROOT, YAML
 
@@ -121,6 +122,12 @@ class YOLO(Model):
                 'trainer': yolo.pose_seg.PoseSegTrainer,
                 'validator': yolo.pose_seg.PoseSegValidator,
                 'predictor': yolo.pose_seg.PoseSegPredictor,
+            },
+            'pose-prompt' : {
+                'model': PosePromptModel,
+                'trainer': yolo.pose_prompt.PosePromptTrainer,
+                'validator': yolo.pose_prompt.PosePromptValidator,
+                'predictor': yolo.pose_prompt.PosePromptPredictor,
             },
             'box-inst' : {
                 'model': BoxInstModel,

@@ -827,6 +827,10 @@ class Mosaic(BaseMixTransform):
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
+        # Preserve the per-image keypoint-ignore flag through mosaic (taken from the primary image,
+        # like im_file/ori_shape above). Without this, keypoint tasks lose batch["ignore_kpt"].
+        if "ignore_kpt" in mosaic_labels[0]:
+            final_labels["ignore_kpt"] = mosaic_labels[0]["ignore_kpt"]
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]

@@ -9,6 +9,11 @@ coco_attributes_file = os.environ.get("COCO_ATTRIBUTES", "/dataset/attributes.tx
 runs_directory = os.environ.get("RUNS_DIR", "/training/runs")
 training_task = os.environ.get("TASK", "detect")   # 'detect' for bbox | 'pose' for hybrid model
 experiment_name = os.environ.get("EXP_NAME", None)  # Results will be saved with this name  under runs/<task>/<exp_name>
+# Keypoint-based tasks: their label files carry keypoints (kpt_shape) and enforce flip_idx.
+KEYPOINT_TASKS = ["pose", "pose-segmentation", "box-inst", "pose-prompt"]
+
+# pose-prompt requires a per-box cluster id column.
+has_cluster = training_task == "pose-prompt"
 
 
 def PrepareDataset(coco_classes_file, dataset_yaml, training_task):
@@ -35,9 +40,12 @@ def PrepareDataset(coco_classes_file, dataset_yaml, training_task):
             f.write("\nattribute_names:\n")
             for i in range(len(attributes)):
                 f.write(f"  {i}: {attributes[i]}\n")
-        if training_task in ["pose", "pose-segmentation", "box-inst"]:
+        if training_task in KEYPOINT_TASKS:
             f.write("\nkpt_shape: [1, 3]\n")  # enforce keypoint shape to [1, 3] for pose models
             f.write("flip_idx: [0]\n")  # enforce left-right flipping of keypoints
+        if has_cluster:
+            # Label rows carry a trailing per-box cluster id column (pose-prompt task).
+            f.write("\nhas_cluster: true\n")
     return
 
 
@@ -50,6 +58,8 @@ def GetModelYaml(task):
         return "yolo11n-pose-seg.yaml"
     elif task == "box-inst":
         return "yolo11n-box-inst.yaml"
+    elif task == "pose-prompt":
+        return "yolo11n-pose-prompt.yaml"
     print(f"Unknown task {task}")
     return None
 
