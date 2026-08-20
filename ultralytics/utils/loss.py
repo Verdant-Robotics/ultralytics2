@@ -192,6 +192,45 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+def rasterize_sorted_boxes(img, gt_bboxes_xyxy, gt_cls, batch_idx, sorted_indices, stride, nc):
+    """Rasterize GT boxes (largest-area first) into a per-class binary union mask at one anchor stride.
+
+    Args:
+        img (torch.Tensor): (B, 3, H, W) images, used only for shape.
+        gt_bboxes_xyxy (torch.Tensor): (T, 4) GT boxes in xyxy, normalized to [0, 1].
+        gt_cls (torch.Tensor): (T, 1) GT class indices.
+        batch_idx (torch.Tensor): (T,) maps each box to its image index in the batch.
+        sorted_indices (Sequence[int]): draw order into gt_bboxes_xyxy (area-descending so smaller
+            boxes paint over larger ones where they overlap).
+        stride (int): anchor stride to rasterize at.
+        nc (int): number of classes (output channel count).
+
+    Returns:
+        (torch.Tensor): (B, nc, H // stride, W // stride) binary union masks.
+    """
+    B, _, img_H, img_W = img.shape
+    anchor_H, anchor_W = img_H // stride, img_W // stride
+
+    gt_bboxes_scaled = gt_bboxes_xyxy.mul(
+        # The negative sign allows us to perform floor() and ceil() as a single tensor operation.
+        torch.Tensor([-anchor_W, -anchor_H, anchor_W, anchor_H]).to(gt_bboxes_xyxy.device)
+    ).ceil().mul(
+        torch.Tensor([-1.0, -1.0, 1.0, 1.0]).to(gt_bboxes_xyxy.device)
+    ).maximum(
+        torch.zeros(4).to(gt_bboxes_xyxy.device)
+    ).minimum(
+        torch.Tensor([anchor_W, anchor_H, anchor_W, anchor_H]).to(gt_bboxes_xyxy.device)
+    ).long()
+    bboxes_img = torch.zeros((B, nc, anchor_H, anchor_W), device=img.device)  # B, C, H, W
+
+    for d_i in sorted_indices:
+        x1, y1, x2, y2 = gt_bboxes_scaled[d_i, :4]
+        b_idx = batch_idx[d_i].long()
+        assert 0 <= x1 < x2 <= anchor_W and 0 <= y1 < y2 <= anchor_H, f"Box {gt_bboxes_xyxy[d_i]} with stride {stride} is out of bounds for image of size {(img_W, img_H)}"
+        bboxes_img[b_idx, int(gt_cls[d_i]), y1:y2, x1:x2] = 1
+    return bboxes_img
+
+
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
@@ -995,20 +1034,162 @@ class v8PSLPose(v8PoseSegLoss):
 
     
 class PoseLossBoxInst(v8PoseLoss):
+    """Criterion for BoxInstModel: v8PoseLoss plus BoxInst's box-supervised mask losses (dice,
+    max-labeling, pairwise color-affinity) computed from GT boxes rasterized at the finest stride.
+    """
+
     def __init__(self, model):
         super().__init__(model)
+        # Read for the live `.training` flag in __call__: mask losses need training-time GT
+        # rasterization and are skipped during eval-time loss reporting.
+        self.model = model
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
         self.seg_ch_num = model.model[-1].seg_ch_num
         self.no = model.model[-1].no
+        self.pairwise_color_thresh = 0.3
+        self.pairwise_dilation = 2
+        self.pairwise_kernel_size = 3
 
     def __call__(self, preds, batch):
         loss = torch.zeros(6, device=self.device)  # box, cls, attributes, dfl, kpt_location, kpt_visibility
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         all_preds = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2)
-        pred_distri, pred_scores, pred_attributes, _ = all_preds.split((self.reg_max * 4, self.nc, self.na, self.seg_ch_num), 1)  # B, S, A        
+        pred_distri, pred_scores, pred_attributes, _ = all_preds.split((self.reg_max * 4, self.nc, self.na, self.seg_ch_num), 1)  # B, S, A
         loss = self.calculate_bbox_kpt_loss(loss=loss, batch=batch, feats=feats, pred_distri=pred_distri, pred_scores=pred_scores, pred_attributes=pred_attributes, pred_kpts=pred_kpts)
         batch_size = pred_distri.shape[0]
-        return loss.sum() * batch_size, loss.detach()
+        box_kpt_loss = loss.sum() * batch_size
+        box_kpt_items = loss.detach()
+
+        if not self.model.training:
+            # Called with precomputed eval-time preds (validation loss reporting): mask losses
+            # can only be computed during training, so report zeros for those two items.
+            seg_loss_item = torch.zeros(1, device=self.device)
+            return box_kpt_loss, torch.cat([box_kpt_items, seg_loss_item, seg_loss_item])
+
+        seg_logits = feats[0][:, -self.seg_ch_num:].float()  # B, seg_ch_num, H, W at the finest anchor stride
+        gt_bitmasks = self._rasterize_class_bitmasks(batch)
+        assert gt_bitmasks.shape[1] == self.seg_ch_num, \
+            f'BoxInst semantic segmentation requires nc ({gt_bitmasks.shape[1]}) == seg_ch_num ({self.seg_ch_num})'
+
+        dice_loss = self.compute_dice_loss(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        bce_loss = self.compute_max_labeling(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks)
+        project_term_losses = (dice_loss[0] + bce_loss[0], dice_loss[1] + bce_loss[1])
+        pairwise_losses = self.compute_pairwise_L1_term(mask_logits=seg_logits, gt_bitmasks=gt_bitmasks, images=batch['img'])
+
+        loss_sum = box_kpt_loss + project_term_losses[0] + pairwise_losses[0]
+        loss_items = torch.cat([box_kpt_items, project_term_losses[1], pairwise_losses[1]])
+        return loss_sum, loss_items
+
+    def compute_max_labeling(self, mask_logits, gt_bitmasks):
+        batch_size = gt_bitmasks.shape[0]
+        cls_mask = (gt_bitmasks > 0).float()
+        foreground = mask_logits.detach().sigmoid() * cls_mask
+        col_max = foreground.amax(dim=2, keepdim=True)
+        row_max = foreground.amax(dim=3, keepdim=True)
+
+        normalizer = torch.minimum(col_max, row_max) * cls_mask
+        positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask, mask_logits.detach())
+        col_box_height = cls_mask.sum(dim=2, keepdim=True)
+        col_pos_count = positives.sum(dim=2, keepdim=True)
+        pos_weights = positives * (col_box_height / col_pos_count.clamp(min=1.0))
+
+        weights = torch.maximum(pos_weights, 1.0 - cls_mask)
+        loss = self.bce(mask_logits, cls_mask) * weights
+        loss = loss.mean() * self.hyp.seg
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+
+    def compute_dice_loss(self, mask_logits, gt_bitmasks):
+        batch_size = gt_bitmasks.shape[0]
+        predictions = mask_logits.sigmoid()
+
+        cls_mask = (gt_bitmasks > 0).float()
+        foreground = predictions.detach() * cls_mask
+        col_max = foreground.amax(dim=2, keepdim=True)
+        row_max = foreground.amax(dim=3, keepdim=True)
+
+        normalizer = torch.minimum(col_max, row_max) * cls_mask
+        positives = (foreground > (0.95 * normalizer)).float() * cls_mask
+        positives = self._add_best_neighbor_positives(positives, foreground, cls_mask, mask_logits.detach())
+        weights = torch.maximum(positives, 1.0 - cls_mask)
+
+        # Dice loss calculated jointly over the batch
+        epsilon = 1
+        numerator = 2 * (predictions * positives).sum(dim=(0, 2, 3))
+        denominator = (predictions * weights).pow(2).sum(dim=(0, 2, 3)) + positives.sum(dim=(0, 2, 3))
+        loss = 1 - (numerator + epsilon) / (denominator + epsilon)
+        loss = loss.mean() * self.hyp.seg
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+
+    def compute_pairwise_L1_term(self, mask_logits, gt_bitmasks, images):
+        batch_size = images.shape[0]
+        predictions = mask_logits.sigmoid()
+        pred_unfold = self._unfold_wo_center(predictions, dilation=self.pairwise_dilation, kernel_size=self.pairwise_kernel_size)  # B, C, K*K-1, H, W
+        pred_diff = predictions[:, :, None] - pred_unfold
+
+        color_similarity = self._images_color_similarity(images)  # B, K*K-1, H, W
+        valid = self._unfold_wo_center(torch.ones_like(mask_logits[:, :1]), dilation=self.pairwise_dilation, kernel_size=self.pairwise_kernel_size)
+        weights = (color_similarity >= self.pairwise_color_thresh).float().unsqueeze(1) * gt_bitmasks.unsqueeze(2) * valid
+        loss = (pred_diff.abs() * weights).sum() / weights.sum().clamp(min=1.0)
+
+        loss = loss * self.hyp.seg
+        return loss * batch_size, torch.tensor([loss.detach()], device=loss.device)
+
+    def _rasterize_class_bitmasks(self, batch):
+        """Rasterizes the gt boxes into per-class binary union masks (B, nc, H, W) at the finest anchor stride."""
+        gt_bboxes_xyxy = xywh2xyxy(batch['bboxes'])
+        return rasterize_sorted_boxes(
+            img=batch['img'], gt_bboxes_xyxy=gt_bboxes_xyxy, gt_cls=batch['cls'], batch_idx=batch['batch_idx'],
+            sorted_indices=range(gt_bboxes_xyxy.shape[0]), stride=int(self.stride[0]), nc=self.nc,
+        )
+
+    def _unfold_wo_center(self, x, dilation, kernel_size):
+        """Returns the K*K-1 dilated neighbours of every pixel: (B, C, H, W) -> (B, C, K*K-1, H, W)."""
+        padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
+        unfolded_x = F.unfold(x, kernel_size=kernel_size, padding=padding, dilation=dilation)
+        unfolded_x = unfolded_x.reshape(x.size(0), x.size(1), -1, x.size(2), x.size(3))
+        size = kernel_size ** 2
+        return torch.cat((unfolded_x[:, :, :size // 2], unfolded_x[:, :, size // 2 + 1:]), dim=2)  # remove the center pixel
+
+    def _images_color_similarity(self, images):
+        """LAB color similarity of every pixel with its K*K-1 neighbours, computed at the finest
+        anchor stride resolution: (B, 3, H*stride, W*stride) -> (B, K*K-1, H, W)."""
+        from kornia.color import rgb_to_lab  # scoped so kornia is only required for box-inst training
+
+        stride = int(self.stride[0])
+        downsampled = F.avg_pool2d(images.float(), kernel_size=stride, stride=stride, padding=0)
+        images_lab = rgb_to_lab(downsampled)
+        diff = images_lab[:, :, None] - self._unfold_wo_center(images_lab, dilation=self.pairwise_dilation, kernel_size=self.pairwise_kernel_size)  # B, 3, K*K-1, H, W
+        return torch.exp(-torch.norm(diff, dim=1) * 0.5)
+
+    def _add_best_neighbor_positives(self, positives, foreground, cls_mask, class_logits):
+        dilation = 1
+        kernel_size = 3
+        neighbor_vals = self._unfold_wo_center(foreground, dilation=dilation, kernel_size=kernel_size)  # B, C, K*K-1, H, W
+        neighbor_in_box = self._unfold_wo_center(cls_mask, dilation=dilation, kernel_size=kernel_size) > 0  # B, C, K*K-1, H, W
+
+        top_class = class_logits.argmax(dim=1)  # B, H, W
+        is_top = F.one_hot(top_class, positives.shape[1]).permute(0, 3, 1, 2).to(foreground.dtype)  # B, C, H, W
+        neighbor_is_top = self._unfold_wo_center(is_top, dilation=dilation, kernel_size=kernel_size) > 0.5  # B, C, K*K-1, H, W
+
+        eligible = neighbor_in_box & neighbor_is_top  # in-box AND dominant class agrees with channel c
+        neighbor_vals = neighbor_vals.masked_fill(~eligible, float('-inf'))  # rank only eligible neighbours
+        best = neighbor_vals.argmax(dim=2)  # B, C, H, W index of highest eligible neighbour in 0..K*K-2
+        sel = F.one_hot(best, num_classes=neighbor_vals.shape[2]).permute(0, 1, 4, 2, 3).to(positives.dtype)
+        sel = sel * positives.unsqueeze(2) * eligible
+
+        padding = (kernel_size + (dilation - 1) * (kernel_size - 1)) // 2
+        size = kernel_size ** 2
+        b, c, _, h, w = sel.shape
+        sel_full = torch.zeros(b, c, size, h, w, device=sel.device, dtype=sel.dtype)
+        sel_full[:, :, :size // 2] = sel[:, :, :size // 2]
+        sel_full[:, :, size // 2 + 1:] = sel[:, :, size // 2:]
+        folded = F.fold(
+            sel_full.reshape(b, c * size, h * w), output_size=(h, w),
+            kernel_size=kernel_size, padding=padding, dilation=dilation,
+        )
+        neighbor_positives = (folded > 0).to(positives.dtype)
+        return (positives + neighbor_positives > 0).to(positives.dtype)
 
 
 class v8ClassificationLoss:
