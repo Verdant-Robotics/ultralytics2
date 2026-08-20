@@ -192,14 +192,12 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
-def rasterize_sorted_boxes(img, gt_bboxes_xyxy, gt_labels, batch_idx, stride):
+def rasterize_boxes(img, gt_bboxes_xyxy, gt_labels, batch_idx, stride):
     """Rasterize GT boxes into a per-channel label map at one anchor stride.
 
     Each box carries a label vector over C channels (e.g. one-hot class, optionally followed by
     attribute channels) with values in {1: positive, 0: negative/absent, -1: unknown}. Where boxes
-    overlap, each pixel/channel is resolved independently by priority 1 > unknown > 0 - so, unlike
-    a plain last-write-wins raster, this is order-independent and callers no longer need to sort
-    boxes by area before calling.
+    overlap, each pixel/channel is resolved independently by priority 1 > unknown > 0, order-independent.
 
     Args:
         img (torch.Tensor): (B, 3, H, W) images, used only for shape.
@@ -1162,13 +1160,13 @@ class PoseLossBoxInst(v8PoseLoss):
 
         Channels are one-hot class labels (nc) followed by attribute labels (na), in that order,
         matching seg_ch_num == nc + na. Attributes already use the {-1: unknown, 0, 1} convention
-        rasterize_sorted_boxes expects (see calculate_attribute_loss).
+        rasterize_boxes expects (see calculate_attribute_loss).
         """
         gt_bboxes_xyxy = xywh2xyxy(batch['bboxes'])
         gt_labels = F.one_hot(batch['cls'].view(-1).long(), num_classes=self.nc).float()  # T, nc
         if 'attributes' in batch:
             gt_labels = torch.cat([gt_labels, batch['attributes'].to(self.device).float()], dim=1)  # T, nc + na
-        return rasterize_sorted_boxes(
+        return rasterize_boxes(
             img=batch['img'], gt_bboxes_xyxy=gt_bboxes_xyxy, gt_labels=gt_labels, batch_idx=batch['batch_idx'],
             stride=int(self.stride[0]),
         )

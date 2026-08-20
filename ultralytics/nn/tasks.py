@@ -85,7 +85,7 @@ from ultralytics.utils.loss import (
     v8SegmentationLoss,
     v8PSLPose,
     PoseLossBoxInst,
-    rasterize_sorted_boxes,
+    rasterize_boxes,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -714,7 +714,7 @@ class PoseSegModel(PoseModel):
         gt_bboxes_xyxy = xywh2xyxy(gt_bboxes)  # T, 4
         gt_labels = F.one_hot(gt_cls.view(-1).long(), num_classes=self.nc).float()  # T, nc
         return [
-            rasterize_sorted_boxes(img, gt_bboxes_xyxy, gt_labels, batch_idx, stride)[0]
+            rasterize_boxes(img, gt_bboxes_xyxy, gt_labels, batch_idx, stride)[0]
             for stride in self.stride.long().tolist()
         ]
 
